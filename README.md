@@ -52,6 +52,20 @@ has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`
 
 See [`examples/main/README.md`](examples/main/README.md) for the full list of `--numa` modes.
 
+### Hybrid NUMA-GPU Execution (MoE Models)
+
+For Mixture-of-Experts (MoE) models, you can run a **Hybrid NUMA-GPU** setup where you offload dense layers (like attention and early/late transformations) to your GPU, while leaving the massive MoE experts to run across all of your CPU's NUMA nodes using the `--numa mirror` strategy.
+
+To optimize performance and avoid costly cross-socket transfers when the CPU communicates with the GPU, use the `--numa-gpu-node N` flag:
+```
+# Example: GPU is attached to NUMA node 0. 
+./build/bin/llama-server -m model.gguf --numa mirror --numa-gpu-node 0 -ngl 10 ...
+```
+- **What it does**: Any dense layers left on the CPU (and the context memory buffer itself) will be strictly pinned and bound to the NUMA node you specify (node `N`). This keeps all GPU-to-CPU data transfers local to the socket directly attached to your GPU.
+- **MoE Experts**: The MoE experts will still fully utilize the `--numa mirror` strategy and execute across *all* available NUMA nodes for maximum speed.
+- **Warning**: If you specify a `--numa-gpu-node`, you *must* ensure you offload all dense layers to the GPU (`-ngl`). Dense layers left on the CPU will run at 50% CPU capacity (on dual-socket systems) because they are artificially restricted to the primary GPU node.
+
+
 # NUMA mode benchmarks
 
 How much does **`--numa mirror`** speed up CPU inference on a dual-socket server, versus
