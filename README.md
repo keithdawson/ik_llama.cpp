@@ -65,6 +65,11 @@ To optimize performance and avoid costly cross-socket transfers when the CPU com
 - **MoE Experts**: The MoE experts will still fully utilize the `--numa mirror` strategy and execute across *all* available NUMA nodes for maximum speed.
 - **Warning**: If you specify a `--numa-gpu-node`, you *must* ensure you offload all dense layers to the GPU (which `-ngl 999` accomplishes, provided you have enough VRAM). Dense layers left on the CPU will run at 50% CPU capacity (on dual-socket systems) because they are artificially restricted to the primary GPU node.
 
+**Maximizing Performance with Excess VRAM**
+GPU compute is significantly faster than CPU compute, even with NUMA mirroring. If you have VRAM left over after offloading the dense layers, you should offload as many MoE experts as will fit.
+- You can achieve this by dropping `--cpu-moe` and using `--n-cpu-moe N` (where `N` is the number of MoE layers to leave on the CPU, pushing the rest to the GPU).
+- Alternatively, simply omit `--cpu-moe` entirely and use `-ngl X` where `X` is a specific number of total layers that fills your GPU VRAM to capacity without overflowing.
+
 
 # NUMA mode benchmarks
 
