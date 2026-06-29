@@ -747,6 +747,7 @@ extern "C" {
         GGML_TENSOR_FLAG_OUTPUT = 2,
         GGML_TENSOR_FLAG_PARAM  = 4,
         GGML_TENSOR_FLAG_LOSS   = 8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        GGML_TENSOR_FLAG_NUMA_MIRROR = 16, // forces mirroring (spreading CPU threads) even if primary_gpu_node is set
     };
 
     enum ggml_tri_type {
@@ -921,8 +922,12 @@ extern "C" {
     // accepts a UTF-8 path, even on Windows
     GGML_API FILE *  ggml_fopen(const char * fname, const char * mode);
 
-    GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
-    GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    GGML_API void ggml_numa_init(enum ggml_numa_strategy numa_flag);
+    GGML_API void ggml_numa_set_primary_gpu_node(int node);
+    GGML_API int  ggml_numa_get_primary_gpu_node(void);
+
+    // true if a numa strategy is active
+    GGML_API bool ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
     // NUMA mirroring (GGML_NUMA_STRATEGY_MIRROR): duplicate read-mostly data per NUMA node
     GGML_API int      ggml_numa_node_count(void);                  // number of NUMA nodes detected (>=1)

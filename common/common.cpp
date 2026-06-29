@@ -2223,6 +2223,14 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.numa_mirror = mask;
         return true;
     }
+    if (arg == "--numa-gpu-node") {
+        if (++i >= argc) {
+            invalid_param = true;
+            return true;
+        }
+        params.numa_gpu_node = std::stoi(argv[i]);
+        return true;
+    }
     if (arg == "-dev" || arg == "--device") {
         CHECK_ARG
         std::string value(argv[i]);
@@ -3241,6 +3249,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
     options.push_back({ "*",           "       --numa-mirror LIST",     "comma list selecting what to mirror with --numa mirror:\n"
                                                                         "  weights, kv, all, none (default: all). implies --numa mirror" });
+    options.push_back({ "*",           "       --numa-gpu-node N",      "if using --numa mirror, pin CPU processing for dense layers to this NUMA node" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
@@ -3957,6 +3966,9 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     // (ggml_numa_init already defaulted this to "all" when --numa mirror was selected).
     if (params.numa == GGML_NUMA_STRATEGY_MIRROR) {
         ggml_numa_set_mirror(params.numa_mirror);
+        if (params.numa_gpu_node >= 0) {
+            ggml_numa_set_primary_gpu_node(params.numa_gpu_node);
+        }
     }
 
     auto mparams = common_model_params_to_llama(params);

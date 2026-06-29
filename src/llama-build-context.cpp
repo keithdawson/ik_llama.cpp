@@ -2313,6 +2313,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             ggml_set_name(cur, name);
         }
 
+        if (strstr(name, "ffn_moe_")) {
+            cur->flags |= GGML_TENSOR_FLAG_NUMA_MIRROR;
+        }
+
         if (!lctx.cparams.offload_kqv) {
             if (strcmp(name, "kqv_merged_cont") == 0) {
                 // all nodes between the KV store and the attention output are run on the CPU

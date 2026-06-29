@@ -3975,6 +3975,16 @@ static bool llm_load_tensors(
         const int max_offloadable_layers       = hparams.n_layer + 1;
 
         LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
+
+        if (ggml_numa_get_primary_gpu_node() >= 0 && n_gpu_layers < max_offloadable_layers) {
+            LLAMA_LOG_WARN("\n"
+                "========================================================================================\n"
+                "WARNING: --numa-gpu-node is set but not all layers are offloaded to the GPU (%d/%d).\n"
+                "         Dense layers remaining on the CPU will only use threads on the primary GPU node,\n"
+                "         reducing CPU performance for those layers. Consider allocating more VRAM to GPU.\n"
+                "========================================================================================\n",
+                std::min(n_gpu_layers, max_offloadable_layers), max_offloadable_layers);
+        }
     }
 
     // print memory requirements

@@ -4503,6 +4503,7 @@ struct ggml_numa_nodes {
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
+    int32_t primary_gpu_node; // -1 if not set, else the preferred node for dense GPU interaction
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -4736,6 +4737,8 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
     GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
 
+    g_state.numa.primary_gpu_node = -1; // init to -1
+
     // figure out which node we're on
     uint current_cpu;
     int getcpu_ret = 0;
@@ -4831,6 +4834,14 @@ void ggml_numa_set_mirror(uint32_t flags) {
 
 uint32_t ggml_numa_get_mirror(void) {
     return g_state.numa.mirror_flags;
+}
+
+void ggml_numa_set_primary_gpu_node(int node) {
+    g_state.numa.primary_gpu_node = node;
+}
+
+int ggml_numa_get_primary_gpu_node(void) {
+    return g_state.numa.primary_gpu_node;
 }
 
 // block split of [0, nth) threads across the detected NUMA nodes. Used by BOTH the thread
@@ -5555,6 +5566,10 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         /*.scratch            =*/ { 0, 0, NULL, },
         /*.scratch_save       =*/ { 0, 0, NULL, },
     };
+
+    if (g_state.numa.primary_gpu_node >= 0 && ctx->mem_buffer_owned) {
+        ggml_numa_bind(ctx->mem_buffer, mem_size, g_state.numa.primary_gpu_node);
+    }
 
     GGML_ASSERT(ctx->mem_buffer != NULL);
 
@@ -27215,7 +27230,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
 #endif
+        if (g_state.numa.primary_gpu_node >= 0 && !(node->flags & GGML_TENSOR_FLAG_NUMA_MIRROR)) {
+            if (ggml_numa_node_for_thread(state->ith, state->shared->n_threads) != g_state.numa.primary_gpu_node) {
+                // Thread is not on primary GPU node, skip computation but participate in barrier
+                goto skip_compute;
+            }
+        }
         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
+skip_compute:
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
         t_eval += tim2 - tim1;
