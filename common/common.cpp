@@ -3249,7 +3249,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
     options.push_back({ "*",           "       --numa-mirror LIST",     "comma list selecting what to mirror with --numa mirror:\n"
                                                                         "  weights, kv, all, none (default: all). implies --numa mirror" });
-    options.push_back({ "*",           "       --numa-gpu-node N",      "if using --numa mirror, pin CPU processing for dense layers to this NUMA node" });
+    options.push_back({ "*",           "       --numa-gpu-node N",      "with --numa mirror, bind non-mirrored host buffers to the NUMA node the GPU\n"
+                                                                        "is attached to (memory placement only; compute uses all nodes)" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",

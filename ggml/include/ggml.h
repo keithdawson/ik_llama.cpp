@@ -747,7 +747,6 @@ extern "C" {
         GGML_TENSOR_FLAG_OUTPUT = 2,
         GGML_TENSOR_FLAG_PARAM  = 4,
         GGML_TENSOR_FLAG_LOSS   = 8, // ...defines loss for numerical optimization (multiple loss tensors add up)
-        GGML_TENSOR_FLAG_NUMA_MIRROR = 16, // forces mirroring (spreading CPU threads) even if primary_gpu_node is set
     };
 
     enum ggml_tri_type {
@@ -923,6 +922,9 @@ extern "C" {
     GGML_API FILE *  ggml_fopen(const char * fname, const char * mode);
 
     GGML_API void ggml_numa_init(enum ggml_numa_strategy numa_flag);
+    // bind non-mirrored host allocations (ggml context buffers) to the NUMA node the GPU is
+    // attached to, so GPU<->CPU traffic stays local to that socket. Purely a memory-placement
+    // hint: compute still runs on all threads of all nodes. -1 (default) disables the binding.
     GGML_API void ggml_numa_set_primary_gpu_node(int node);
     GGML_API int  ggml_numa_get_primary_gpu_node(void);
 

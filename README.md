@@ -56,14 +56,13 @@ See [`examples/main/README.md`](examples/main/README.md) for the full list of `-
 
 For Mixture-of-Experts (MoE) models, you can run a **Hybrid NUMA-GPU** setup where you offload dense layers (like attention and early/late transformations) to your GPU, while leaving the massive MoE experts to run across all of your CPU's NUMA nodes using the `--numa mirror` strategy.
 
-To optimize performance and avoid costly cross-socket transfers when the CPU communicates with the GPU, use the `--numa-gpu-node N` flag in combination with `-ngl 999` and `--cpu-moe`:
+To reduce cross-socket traffic when the CPU communicates with the GPU, add `--numa-gpu-node N`, where `N` is the NUMA node your GPU is attached to (check with `nvidia-smi topo -m`):
 ```
-# Example: GPU is attached to NUMA node 0. 
-./build/bin/llama-server -m model.gguf --numa mirror --numa-gpu-node 0 -ngl 999 --cpu-moe ...
+# Example: GPU is attached to NUMA node 1.
+./build/bin/llama-server -m model.gguf --numa mirror --numa-gpu-node 1 -ngl 999 --cpu-moe ...
 ```
-- **What it does**: `-ngl 999` attempts to offload all layers to the GPU, but `--cpu-moe` overrides this to keep all MoE experts on the CPU. The dense layers (and the context memory buffer) that remain on the GPU are strictly pinned and bound to the NUMA node you specify (node `N`). This keeps all GPU-to-CPU data transfers local to the socket directly attached to your GPU.
-- **MoE Experts**: The MoE experts will still fully utilize the `--numa mirror` strategy and execute across *all* available NUMA nodes for maximum speed.
-- **Warning**: If you specify a `--numa-gpu-node`, you *must* ensure you offload all dense layers to the GPU (which `-ngl 999` accomplishes, provided you have enough VRAM). Dense layers left on the CPU will run at 50% CPU capacity (on dual-socket systems) because they are artificially restricted to the primary GPU node.
+- **What it does**: `-ngl 999` attempts to offload all layers to the GPU, but `--cpu-moe` overrides this to keep all MoE experts on the CPU. `--numa-gpu-node N` binds the non-mirrored host-side buffers to node `N`, so host memory the GPU interacts with sits on the socket the GPU is attached to. It is purely a memory-placement hint and does not change how compute is scheduled.
+- **MoE Experts**: The MoE experts (and any other CPU-resident layers) still fully utilize the `--numa mirror` strategy and execute across *all* available NUMA nodes for maximum speed — model output is identical with or without `--numa-gpu-node`.
 
 **Maximizing Performance with Excess VRAM**
 GPU compute is significantly faster than CPU compute, even with NUMA mirroring. If you have VRAM left over after offloading the dense layers, you should offload as many MoE experts as will fit.

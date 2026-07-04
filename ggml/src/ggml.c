@@ -4837,6 +4837,12 @@ uint32_t ggml_numa_get_mirror(void) {
 }
 
 void ggml_numa_set_primary_gpu_node(int node) {
+    if (node < 0 || node >= (int) g_state.numa.n_nodes) {
+        fprintf(stderr, "%s: node %d is not a valid NUMA node (%u nodes detected), ignoring\n",
+                __func__, node, g_state.numa.n_nodes);
+        g_state.numa.primary_gpu_node = -1;
+        return;
+    }
     g_state.numa.primary_gpu_node = node;
 }
 
@@ -27230,14 +27236,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
 #endif
-        if (g_state.numa.primary_gpu_node >= 0 && !(node->flags & GGML_TENSOR_FLAG_NUMA_MIRROR)) {
-            if (ggml_numa_node_for_thread(state->ith, state->shared->n_threads) != g_state.numa.primary_gpu_node) {
-                // Thread is not on primary GPU node, skip computation but participate in barrier
-                goto skip_compute;
-            }
-        }
         node_n = ggml_compute_forward(&params, node, cgraph, node_n);
-skip_compute:
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
         t_eval += tim2 - tim1;
