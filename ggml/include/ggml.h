@@ -927,6 +927,11 @@ extern "C" {
     // hint: compute still runs on all threads of all nodes. -1 (default) disables the binding.
     GGML_API void ggml_numa_set_primary_gpu_node(int node);
     GGML_API int  ggml_numa_get_primary_gpu_node(void);
+    // additionally bind the scheduler's CPU compute buffers (intermediate tensor data,
+    // i.e. what the GPU DMAs from/to) to the primary GPU node. Trade-off: GPU transfers
+    // become node-local, but expert threads on other nodes write their outputs remotely.
+    GGML_API void ggml_numa_set_bind_compute(bool enable);
+    GGML_API bool ggml_numa_get_bind_compute(void);
 
     // true if a numa strategy is active
     GGML_API bool ggml_is_numa(void); // true if init detected that system has >1 NUMA node

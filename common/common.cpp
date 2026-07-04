@@ -2231,6 +2231,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.numa_gpu_node = std::stoi(argv[i]);
         return true;
     }
+    if (arg == "--numa-bind-compute") {
+        params.numa_bind_compute = true;
+        return true;
+    }
     if (arg == "-dev" || arg == "--device") {
         CHECK_ARG
         std::string value(argv[i]);
@@ -3251,6 +3255,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  weights, kv, all, none (default: all). implies --numa mirror" });
     options.push_back({ "*",           "       --numa-gpu-node N",      "with --numa mirror, bind non-mirrored host buffers to the NUMA node the GPU\n"
                                                                         "is attached to (memory placement only; compute uses all nodes)" });
+    options.push_back({ "*",           "       --numa-bind-compute",    "with --numa-gpu-node, also bind the CPU compute buffers (data the GPU\n"
+                                                                        "transfers from/to) to that node. A/B test: makes GPU DMA node-local at the\n"
+                                                                        "cost of remote writes from expert threads on other nodes" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
@@ -3969,6 +3976,9 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         ggml_numa_set_mirror(params.numa_mirror);
         if (params.numa_gpu_node >= 0) {
             ggml_numa_set_primary_gpu_node(params.numa_gpu_node);
+        }
+        if (params.numa_bind_compute) {
+            ggml_numa_set_bind_compute(true);
         }
     }
 

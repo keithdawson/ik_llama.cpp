@@ -162,3 +162,4 @@ a.out
 a.out.*
 .dev
 .github
+numa-ab-results/

@@ -194,6 +194,10 @@ extern "C" {
 
     GGML_API size_t               ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
+    // NUMA: migrate the scheduler's CPU compute buffers onto the given node (Linux mbind, best effort).
+    // Returns the total number of bytes bound.
+    GGML_API size_t               ggml_backend_sched_numa_bind_cpu_buffers(ggml_backend_sched_t sched, int node);
+
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 

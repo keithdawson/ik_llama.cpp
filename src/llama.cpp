@@ -6214,6 +6214,9 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         lctx.reset_scheduler();
         if (!ggml_backend_sched_reserve(lctx.sched, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        } else if (ggml_numa_get_bind_compute()) {
+            // re-reserve may have replaced the CPU compute buffers; re-bind them
+            ggml_backend_sched_numa_bind_cpu_buffers(lctx.sched, ggml_numa_get_primary_gpu_node());
         }
     }
     return 0;
@@ -7633,6 +7636,12 @@ struct llama_context * llama_init_from_model(
                             ggml_backend_buft_name(buft),
                             size / 1024.0 / 1024.0);
                 }
+            }
+
+            if (ggml_numa_get_bind_compute()) {
+                size_t bound = ggml_backend_sched_numa_bind_cpu_buffers(ctx->sched, ggml_numa_get_primary_gpu_node());
+                LLAMA_LOG_INFO("%s: bound %.2f MiB of CPU compute buffers to NUMA node %d\n", __func__,
+                        bound / 1024.0 / 1024.0, ggml_numa_get_primary_gpu_node());
             }
 
             // note: the number of splits during measure is higher than during inference due to the kv shift

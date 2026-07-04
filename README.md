@@ -63,6 +63,7 @@ To reduce cross-socket traffic when the CPU communicates with the GPU, add `--nu
 ```
 - **What it does**: `-ngl 999` attempts to offload all layers to the GPU, but `--cpu-moe` overrides this to keep all MoE experts on the CPU. `--numa-gpu-node N` binds the non-mirrored host-side buffers to node `N`, so host memory the GPU interacts with sits on the socket the GPU is attached to. It is purely a memory-placement hint and does not change how compute is scheduled.
 - **MoE Experts**: The MoE experts (and any other CPU-resident layers) still fully utilize the `--numa mirror` strategy and execute across *all* available NUMA nodes for maximum speed — model output is identical with or without `--numa-gpu-node`.
+- **`--numa-bind-compute`** (experimental, requires `--numa-gpu-node`): additionally binds the CPU compute buffers — the intermediate tensor data the GPU DMAs from/to every layer — to the GPU's node. This makes GPU transfers node-local at the cost of remote writes from expert threads on the other node(s); whether it nets positive depends on the workload, so A/B it. See [`docs/numa-tuning.md`](docs/numa-tuning.md) for the measurement guide and [`scripts/numa-ab.py`](scripts/numa-ab.py) for a harness that automates the comparison.
 
 **Maximizing Performance with Excess VRAM**
 GPU compute is significantly faster than CPU compute, even with NUMA mirroring. If you have VRAM left over after offloading the dense layers, you should offload as many MoE experts as will fit.

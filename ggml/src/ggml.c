@@ -4504,6 +4504,7 @@ struct ggml_numa_nodes {
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
     int32_t primary_gpu_node; // -1 if not set, else the preferred node for dense GPU interaction
+    bool bind_compute; // when primary_gpu_node is set: also bind the sched CPU compute buffers to it
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -4738,6 +4739,7 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
 
     g_state.numa.primary_gpu_node = -1; // init to -1
+    g_state.numa.bind_compute = false;
 
     // figure out which node we're on
     uint current_cpu;
@@ -4848,6 +4850,18 @@ void ggml_numa_set_primary_gpu_node(int node) {
 
 int ggml_numa_get_primary_gpu_node(void) {
     return g_state.numa.primary_gpu_node;
+}
+
+void ggml_numa_set_bind_compute(bool enable) {
+    if (enable && g_state.numa.primary_gpu_node < 0) {
+        fprintf(stderr, "%s: --numa-bind-compute requires a valid --numa-gpu-node, ignoring\n", __func__);
+        return;
+    }
+    g_state.numa.bind_compute = enable;
+}
+
+bool ggml_numa_get_bind_compute(void) {
+    return g_state.numa.bind_compute && g_state.numa.primary_gpu_node >= 0;
 }
 
 // block split of [0, nth) threads across the detected NUMA nodes. Used by BOTH the thread
