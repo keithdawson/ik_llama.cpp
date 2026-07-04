@@ -14,9 +14,16 @@ A scripted harness that automates most of this is in [`scripts/numa-ab.py`](../s
 | `--numa mirror` | one copy of weights (+ KV if on CPU) per node | N× RAM for mirrored data |
 | `--numa-gpu-node N` | ggml context arenas (tensor metadata) → node N | negligible; prerequisite for the next flag |
 | `--numa-bind-compute` | scheduler CPU compute buffers (intermediate tensor data — what the GPU DMAs from/to) → node N | GPU transfers become node-local, but expert threads on *other* nodes write outputs remotely |
+| `GGML_NUMA_PIN=cpu` (env) | pins each mirror thread to one *specific* CPU instead of "anywhere on its node" | no cross-CCD thread migration (each EPYC CCD has its own L3), physical cores before SMT siblings — but the scheduler loses the freedom to dodge other load on the socket |
 
-`--numa-bind-compute` is the experiment: whether it helps depends on batch size, layer
-count, and fabric load. Measure, don't assume.
+`--numa-bind-compute` and `GGML_NUMA_PIN=cpu` are the experiments: whether they help
+depends on batch size, cache behavior, and what else runs on the box. Measure, don't
+assume — `numa-ab.py matrix` (below) sweeps them for you.
+
+Build note: make sure the build has **OpenMP** enabled (it is by default — verify with
+`grep GGML_OPENMP build/CMakeCache.txt`, or `ldd build/bin/llama-server | grep gomp`).
+Without OpenMP, worker threads are created and joined on *every* graph compute, which
+is real per-token overhead at high thread counts.
 
 ## 1. Verifying placement: `numastat` and `numa_maps`
 
@@ -167,3 +174,28 @@ Notes:
 4. Only then compare traffic counters (§3) to explain *why* the numbers moved.
 
 `scripts/numa-ab.py` automates steps 2–4 and prints a comparison table.
+
+### Sweeping a whole test matrix
+
+`numa-ab.py matrix` runs the cartesian product of thread counts × pin modes × flag
+sets, then tabulates. Use a `{t}` placeholder where the thread count goes:
+
+```
+sudo ./scripts/numa-ab.py matrix --name sweep --reserve-node0 16 \
+    --threads 128,160,176 --pin node,cpu \
+    --extra '--numa-gpu-node 1|--numa-gpu-node 1 --numa-bind-compute' -- \
+    ./build/bin/llama-cli -m model.gguf --numa mirror -t {t} -ngl 999 --cpu-moe \
+    -p "<long prompt>" -n 128 --ignore-eos
+```
+
+That example is 3 × 2 × 2 = 12 runs; the report at the end shows throughput, remote
+DRAM-fill ratio, per-node placement, and which env/flags each run used.
+
+## Notes on cold-path costs
+
+Mirror population at load and KV resync (context shift / K-shift, session restore)
+use a parallel node-pinned copy (`ggml_numa_memcpy_to_node`, up to 16 threads pinned
+to the destination node) instead of a single-threaded memcpy, so copies run at
+roughly interconnect speed rather than one core's memcpy speed. Context shifts on a
+large populated cache still copy the whole K cache once — expect a brief stall on
+that event, not a per-token cost.

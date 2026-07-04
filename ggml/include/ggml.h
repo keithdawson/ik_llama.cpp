@@ -945,6 +945,9 @@ extern "C" {
     // allocate/free memory bound to a specific NUMA node (mmap + mbind + THP)
     GGML_API void *   ggml_numa_alloc(size_t size, int node);
     GGML_API void     ggml_numa_free(void * ptr, size_t size);
+    // parallel memcpy using threads pinned to the destination node (writes stay node-local).
+    // Falls back to plain memcpy for small sizes or when node/threads are unavailable.
+    GGML_API void     ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int node);
     // best-effort migrate an already-populated range onto a node (mbind + MPOL_MF_MOVE)
     GGML_API void     ggml_numa_bind(void * ptr, size_t size, int node);
     // attach/detach per-node copies to a tensor. node_data must have ggml_numa_node_count() entries.

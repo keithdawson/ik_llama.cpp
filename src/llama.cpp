@@ -6837,7 +6837,8 @@ static void llama_mirror_model_weights(const llama_model & model) {
         for (int n = 1; n < n_nodes; ++n) {
             void * p = ggml_numa_alloc(mb.size, n);
             if (!p) { ok = false; break; }
-            memcpy(p, base, mb.size);           // MPOL_BIND places these faulted pages on node n
+            // parallel copy with threads pinned to node n (MPOL_BIND places the faulted pages there)
+            ggml_numa_memcpy_to_node(p, base, mb.size, n);
             mb.node_base[n] = p;
         }
         if (!ok) {
@@ -6932,12 +6933,13 @@ static void llama_mirror_kv_cache(struct llama_kv_cache & cache) {
         ggml_numa_bind(base, mb.size, 0);  // best-effort migrate it onto node 0
         bool ok = true;
         for (int n = 1; n < n_nodes; ++n) {
-            void * p = ggml_numa_alloc(mb.size, n); // mmap(ANON) is zero-filled, matching the cleared buffer
+            void * p = ggml_numa_alloc(mb.size, n);
             if (!p) { ok = false; break; }
-            // fault the pages now (and place them node-locally) so this allocation actually counts
-            // against MemAvailable; otherwise the weight-mirror RAM check can't see this reservation
-            // and combined over-subscription would surface as a mid-decode SIGBUS instead of here.
-            memset(p, 0, mb.size);
+            // copy the (just-cleared) buffer to fault the pages now, placing them node-locally and
+            // making the allocation count against MemAvailable; otherwise the weight-mirror RAM
+            // check can't see this reservation and combined over-subscription would surface as a
+            // mid-decode SIGBUS instead of here.
+            ggml_numa_memcpy_to_node(p, base, mb.size, n);
             mb.node_base[n] = p;
         }
         if (!ok) {

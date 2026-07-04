@@ -308,10 +308,17 @@ def cmd_run(args, workload):
         elif args.bw_tool == "perf":
             print("WARNING: no usable perf DRAM-fill events found", file=sys.stderr)
 
-    print("launching: %s" % " ".join(launch + workload))
+    env = dict(os.environ)
+    for kv in (args.env or []):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            env[k] = v
+
+    print("launching: %s%s" % (
+        "".join("%s " % kv for kv in (args.env or [])), " ".join(launch + workload)))
     logf = open(log_path, "w")
     proc = subprocess.Popen(launch + workload, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
+                            stderr=subprocess.STDOUT, text=True, env=env)
     output_chunks = []
 
     def pump():
@@ -362,6 +369,7 @@ def cmd_run(args, workload):
         "name": args.name,
         "timestamp": stamp,
         "cmd": workload,
+        "env": args.env or [],
         "allowed_cpus": format_cpulist(allowed) if allowed else "all",
         "exit_code": proc.returncode,
         "metrics": metrics,
@@ -387,6 +395,47 @@ def cmd_run(args, workload):
     if perfs:
         print("remote DRAM-fill ratio: avg %.2f%% (n=%d)" % (sum(perfs) / len(perfs), len(perfs)))
     print("saved: %s" % out_path)
+
+
+# ---------------------------------------------------------------- matrix
+
+def cmd_matrix(args, workload):
+    """Cartesian sweep: threads x pin mode x extra flag sets, each run via cmd_run."""
+    threads = [t.strip() for t in args.threads.split(",")] if args.threads else [None]
+    pins    = [p.strip() for p in args.pin.split(",")] if args.pin else [None]
+    extras  = [e.strip() for e in args.extra.split("|")] if args.extra else [""]
+
+    combos = []
+    for t in threads:
+        for p in pins:
+            for e in extras:
+                combos.append((t, p, e))
+    print("matrix: %d runs" % len(combos))
+
+    for i, (t, p, e) in enumerate(combos):
+        wl = list(workload)
+        if t is not None:
+            if not any("{t}" in a for a in wl):
+                sys.exit("matrix: --threads given but workload has no {t} placeholder (e.g. -t {t})")
+            wl = [a.replace("{t}", t) for a in wl]
+        if e:
+            wl += e.split()
+        name = args.name
+        if t is not None:
+            name += "-t%s" % t
+        if p is not None:
+            name += "-pin%s" % p
+        if e:
+            name += "-x%d" % extras.index(e)
+        run_args = argparse.Namespace(
+            name=name, allowed_cpus=args.allowed_cpus, reserve_node0=args.reserve_node0,
+            interval=args.interval, bw_tool=args.bw_tool, quiet=args.quiet,
+            results_dir=args.results_dir,
+            env=(["GGML_NUMA_PIN=%s" % p] if p and p != "node" else []))
+        print("\n[%d/%d] %s" % (i + 1, len(combos), name))
+        cmd_run(run_args, wl)
+
+    cmd_report(argparse.Namespace(results_dir=args.results_dir))
 
 
 # ---------------------------------------------------------------- monitor
@@ -439,18 +488,19 @@ def cmd_report(args):
             "rss": last["per_node_mib"] if last else {},
             "remote": round(sum(perfs) / len(perfs), 2) if perfs else None,
             "cpus": r.get("allowed_cpus", "?"),
+            "env": " ".join(r.get("env", [])),
         })
     if not rows:
         print("no results in %s" % args.results_dir)
         return
-    fmt = "%-20s %-15s %10s %10s %9s %-28s %s"
-    print(fmt % ("name", "when", "pp t/s", "tg t/s", "remote%", "rss per node (MiB)", "cpus"))
+    fmt = "%-26s %-15s %10s %10s %9s %-28s %-18s %s"
+    print(fmt % ("name", "when", "pp t/s", "tg t/s", "remote%", "rss per node (MiB)", "env", "cpus"))
     for r in rows:
         print(fmt % (r["name"], r["when"],
                      r["pp"] if r["pp"] is not None else "-",
                      r["tg"] if r["tg"] is not None else "-",
                      r["remote"] if r["remote"] is not None else "-",
-                     json.dumps(r["rss"]), r["cpus"]))
+                     json.dumps(r["rss"]), r["env"] or "-", r["cpus"]))
 
 
 # ---------------------------------------------------------------- main
@@ -467,6 +517,21 @@ def main():
     p.add_argument("--interval", type=int, default=10, help="telemetry sample interval, seconds")
     p.add_argument("--bw-tool", choices=["auto", "perf", "none"], default="auto")
     p.add_argument("--quiet", action="store_true", help="do not echo workload output")
+    p.add_argument("--results-dir", default=RESULTS_DIR)
+    p.add_argument("--env", action="append", default=[],
+                   help="KEY=VAL to set in the workload environment (repeatable)")
+
+    p = sub.add_parser("matrix", help="sweep threads x pin mode x flag sets and tabulate")
+    p.add_argument("--name", required=True, help="prefix for the generated run names")
+    p.add_argument("--threads", help="comma list substituted into a {t} placeholder, e.g. 128,160,176")
+    p.add_argument("--pin", help="comma list of GGML_NUMA_PIN modes: node,cpu")
+    p.add_argument("--extra", help="'|'-separated flag sets appended to the workload, "
+                                   "e.g. '--numa-gpu-node 1|--numa-gpu-node 1 --numa-bind-compute'")
+    p.add_argument("--allowed-cpus")
+    p.add_argument("--reserve-node0", type=int, default=0)
+    p.add_argument("--interval", type=int, default=10)
+    p.add_argument("--bw-tool", choices=["auto", "perf", "none"], default="auto")
+    p.add_argument("--quiet", action="store_true")
     p.add_argument("--results-dir", default=RESULTS_DIR)
 
     p = sub.add_parser("monitor", help="live placement view of a running process")
@@ -492,6 +557,10 @@ def main():
         if not workload:
             sys.exit("run: pass the workload after '--', e.g. numa-ab.py run --name a -- ./llama-cli ...")
         cmd_run(args, workload)
+    elif args.cmd == "matrix":
+        if not workload:
+            sys.exit("matrix: pass the workload after '--' (use a {t} placeholder with --threads)")
+        cmd_matrix(args, workload)
     elif args.cmd == "monitor":
         cmd_monitor(args)
     else:

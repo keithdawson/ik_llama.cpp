@@ -4505,6 +4505,7 @@ struct ggml_numa_nodes {
     uint32_t current_node; // node on which main process is execting
     int32_t primary_gpu_node; // -1 if not set, else the preferred node for dense GPU interaction
     bool bind_compute; // when primary_gpu_node is set: also bind the sched CPU compute buffers to it
+    bool pin_cpu; // GGML_NUMA_PIN=cpu: pin each mirror thread to one specific CPU (CCD/L3 locality)
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -4741,6 +4742,14 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     g_state.numa.primary_gpu_node = -1; // init to -1
     g_state.numa.bind_compute = false;
 
+    // GGML_NUMA_PIN=cpu pins each mirror-mode thread to one specific CPU instead of the whole
+    // node, preventing the scheduler from migrating threads across CCDs (each with its own L3).
+    // Physical cores come first in sysfs order, so SMT siblings are only used when oversubscribed.
+    {
+        const char * pin = getenv("GGML_NUMA_PIN");
+        g_state.numa.pin_cpu = pin != NULL && (strcmp(pin, "cpu") == 0 || strcmp(pin, "1") == 0);
+    }
+
     // figure out which node we're on
     uint current_cpu;
     int getcpu_ret = 0;
@@ -4956,6 +4965,84 @@ void ggml_numa_bind(void * ptr, size_t size, int node) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// parallel node-pinned memcpy: used to populate weight/KV mirrors at load and to
+// resync KV mirrors after out-of-graph writes (K-shift, state restore). A single
+// thread tops out well below the socket interconnect's bandwidth; several threads
+// pinned to the *destination* node (local writes, remote reads) get close to it.
+// ---------------------------------------------------------------------------
+#if defined(__gnu_linux__)
+struct ggml_numa_copy_slice {
+    const char * src;
+    char *       dst;
+    size_t       size;
+    int          node;
+};
+
+static void * ggml_numa_copy_worker(void * arg) {
+    struct ggml_numa_copy_slice * s = (struct ggml_numa_copy_slice *) arg;
+    if (s->node >= 0 && s->node < (int) g_state.numa.n_nodes) {
+        const struct ggml_numa_node * nd = &g_state.numa.nodes[s->node];
+        size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
+        cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
+        if (cpus) {
+            CPU_ZERO_S(setsize, cpus);
+            for (uint32_t i = 0; i < nd->n_cpus; ++i) {
+                CPU_SET_S(nd->cpus[i], setsize, cpus);
+            }
+            pthread_setaffinity_np(pthread_self(), setsize, cpus); // best effort
+            CPU_FREE(cpus);
+        }
+    }
+    memcpy(s->dst, s->src, s->size);
+    return NULL;
+}
+#endif
+
+#define GGML_NUMA_COPY_MIN_PARALLEL (64u << 20) // below this a single memcpy wins
+#define GGML_NUMA_COPY_MAX_THREADS  16
+
+void ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int node) {
+#if defined(__gnu_linux__)
+    int nthr = GGML_NUMA_COPY_MAX_THREADS;
+    if (node >= 0 && node < (int) g_state.numa.n_nodes && (int) g_state.numa.nodes[node].n_cpus < nthr) {
+        nthr = (int) g_state.numa.nodes[node].n_cpus;
+    }
+    if (size < GGML_NUMA_COPY_MIN_PARALLEL || nthr <= 1 || g_state.numa.n_nodes < 2) {
+        memcpy(dst, src, size);
+        return;
+    }
+    pthread_t threads[GGML_NUMA_COPY_MAX_THREADS];
+    struct ggml_numa_copy_slice slices[GGML_NUMA_COPY_MAX_THREADS];
+    const size_t chunk = (size + nthr - 1) / nthr;
+    int started = 0;
+    for (int i = 0; i < nthr; ++i) {
+        const size_t off = (size_t) i * chunk;
+        if (off >= size) break;
+        slices[i].src  = (const char *) src + off;
+        slices[i].dst  = (char *) dst + off;
+        slices[i].size = off + chunk <= size ? chunk : size - off;
+        slices[i].node = node;
+        if (pthread_create(&threads[i], NULL, ggml_numa_copy_worker, &slices[i]) != 0) {
+            // couldn't spawn more workers: do this slice (and the rest) inline
+            for (int j = i; j < nthr; ++j) {
+                const size_t o = (size_t) j * chunk;
+                if (o >= size) break;
+                memcpy((char *) dst + o, (const char *) src + o, o + chunk <= size ? chunk : size - o);
+            }
+            break;
+        }
+        ++started;
+    }
+    for (int i = 0; i < started; ++i) {
+        pthread_join(threads[i], NULL);
+    }
+#else
+    UNUSED(node);
+    memcpy(dst, src, size);
+#endif
+}
+
 // Configure the hierarchical barrier for the given thread count. Called single-threaded from
 // ggml_graph_compute before workers start. Allocates the node-local counter lines once.
 // Activates only when NUMA mirroring is on (threads are pinned per node, matching the block split
@@ -5033,7 +5120,7 @@ void ggml_numa_tensor_resync(struct ggml_tensor * tensor) {
     const size_t nbytes = ggml_nbytes(tensor);
     for (int n = 1; n < nodes; ++n) { // node 0 aliases tensor->data
         if (m->data[n] && m->data[n] != tensor->data) {
-            memcpy(m->data[n], tensor->data, nbytes);
+            ggml_numa_memcpy_to_node(m->data[n], tensor->data, nbytes, n);
         }
     }
 }
@@ -26726,8 +26813,32 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
 
     cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
     CPU_ZERO_S(setsize, cpus);
-    for (size_t i = 0; i < node->n_cpus; ++i) {
-        CPU_SET_S(node->cpus[i], setsize, cpus);
+
+    // GGML_NUMA_PIN=cpu (mirror only): pin this thread to one specific CPU of its node so the
+    // scheduler can't migrate it across CCDs and drag its working set between L3 caches.
+    // Threads take the node's allowed CPUs in sysfs order (physical cores before SMT siblings);
+    // CPUs outside the process's original affinity mask (numactl/cgroup) are skipped.
+    bool pinned_single = false;
+    if (g_state.numa.pin_cpu && g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR) {
+        const int n = (int) g_state.numa.n_nodes;
+        const int first = (node_num * n_threads + n - 1) / n; // first thread of this node's block
+        const int local = thread_n - first;
+        uint32_t allowed[GGML_NUMA_MAX_CPUS];
+        uint32_t n_allowed = 0;
+        for (uint32_t i = 0; i < node->n_cpus; ++i) {
+            if (CPU_ISSET(node->cpus[i], &g_state.numa.cpuset)) {
+                allowed[n_allowed++] = node->cpus[i];
+            }
+        }
+        if (n_allowed > 0 && local >= 0) {
+            CPU_SET_S(allowed[local % n_allowed], setsize, cpus);
+            pinned_single = true;
+        }
+    }
+    if (!pinned_single) {
+        for (size_t i = 0; i < node->n_cpus; ++i) {
+            CPU_SET_S(node->cpus[i], setsize, cpus);
+        }
     }
 
     rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
