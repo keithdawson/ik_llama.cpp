@@ -314,6 +314,8 @@ struct gpt_params {
     int numa_gpu_node = -1; // -1 if not set, else the node where the GPU is located
     bool numa_bind_compute = false; // bind sched CPU compute buffers to numa_gpu_node
 
+    bool kv_unified = false; // server: slots share the KV pool elastically instead of fixed n_ctx/n_parallel quotas
+
     enum llama_split_mode        split_mode        = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings

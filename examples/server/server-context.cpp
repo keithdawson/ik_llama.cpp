@@ -271,9 +271,12 @@ bool server_context::load_model(const gpt_params& params_) {
 }
 
 void server_context::init() {
-    const int32_t n_ctx_slot = n_ctx / params_base.n_parallel;
+    // --kv-unified: every slot may use up to the whole shared KV pool (first come, first
+    // served; pool pressure is relieved by shifting the largest slot). Otherwise each
+    // slot gets a fixed equal share.
+    const int32_t n_ctx_slot = params_base.kv_unified ? n_ctx : n_ctx / params_base.n_parallel;
 
-    LOG_INFO("initializing slots", { {"n_slots", params_base.n_parallel} });
+    LOG_INFO("initializing slots", { {"n_slots", params_base.n_parallel}, {"kv_unified", params_base.kv_unified} });
 
     if (params_base.has_mtp) {
         SRV_INF("%s\n", "MTP needs embeddings on decode, enabling");
@@ -3377,6 +3380,69 @@ bool server_context::slots_idle(){
         return all_idle;
 }
 
+bool server_context::evict_idle_slot_cache() {
+    // --kv-unified: drop the least-recently-used idle slot's retained prompt cache to make
+    // room in the shared KV pool. Idle slots keep their KV for prefix reuse, which is free
+    // under fixed quotas but squats on the shared pool in unified mode; evicting only costs
+    // that user a re-prefill if they return.
+    server_slot * victim = nullptr;
+    for (server_slot & s : slots) {
+        if (!s.is_processing() && s.cache_tokens.size() > 0 &&
+            (!victim || s.t_last_used < victim->t_last_used)) {
+            victim = &s;
+        }
+    }
+    if (!victim) {
+        return false;
+    }
+    LOG_INFO("kv-unified: evicting idle slot's retained cache under pool pressure", {
+        {"id_slot",        victim->id},
+        {"n_cache_tokens", victim->cache_tokens.size()},
+    });
+    llama_kv_cache_seq_rm(ctx, victim->id, -1, -1);
+    victim->cache_tokens.keep_first(0);
+    victim->server_cached_prompt.checkpoints.clear();
+    victim->server_cached_prompt.data.clear();
+    return true;
+}
+
+bool server_context::shift_slot_context(server_slot & slot) {
+    // Shift context
+    int n_keep = slot.params.n_keep < 0 ? slot.prompt_tokens.size() : slot.params.n_keep;
+    if (add_bos_token) {
+        n_keep += 1;
+    }
+    n_keep = std::min(slot.n_ctx - 4, n_keep);
+
+    const int32_t n_left = (int)system_tokens.size() + slot.n_past - n_keep;
+    int32_t n_discard = slot.params.n_discard ? slot.params.n_discard : (n_left / 2);
+    int32_t n_kept;
+    int32_t n_discard_cache;
+    adjust_n_to_support_context_shift(slot.cache_tokens, n_keep, n_discard);
+    if (n_discard <= 0 || !tokens_support_context_shift(slot.cache_tokens, n_keep, n_discard)) {
+        return false;
+    }
+    context_shift_find_n_tokens(ctx, slot.prompt_tokens, slot.cache_tokens, n_keep,
+        n_discard, n_kept, n_discard_cache);
+    LOG_INFO("slot context shift", {
+                         {"id_slot",         slot.id},
+                         {"id_task",         slot.id_task},
+                         {"n_keep",          n_keep},
+                         {"n_left",          n_left},
+                         {"n_discard",       n_discard},
+                         {"n_ctx",           n_ctx},
+                         {"n_past",          slot.n_past},
+                         {"n_system_tokens", system_tokens.size()},
+                         {"n_cache_tokens",  slot.cache_tokens.size()}
+        });
+    slot.n_discarded_prompt = slot.n_discarded_prompt + n_discard;
+    slot.n_kept_prompt = n_keep;
+    discard_n_kv_and_cache_tokens(ctx, slot, n_kept, n_discard_cache);
+    slot.n_past -= n_discard_cache;
+    slot.truncated = true;
+    return true;
+}
+
 void server_context::context_shift() {
     for (server_slot& slot : slots) {
         if (slot.ga_n == 1) {
@@ -3389,39 +3455,44 @@ void server_context::context_shift() {
                     send_error(slot, "context shift is disabled", ERROR_TYPE_SERVER);
                     continue;
                 }
-                // Shift context
-                int n_keep = slot.params.n_keep < 0 ? slot.prompt_tokens.size() : slot.params.n_keep;
-                if (add_bos_token) {
-                    n_keep += 1;
-                }
-                n_keep = std::min(slot.n_ctx - 4, n_keep);
+                shift_slot_context(slot);
+            }
+        }
+    }
 
-                const int32_t n_left = (int)system_tokens.size() + slot.n_past - n_keep;
-                int32_t n_discard = slot.params.n_discard ? slot.params.n_discard : (n_left / 2);
-                int32_t n_kept;
-                int32_t n_discard_cache;
-                adjust_n_to_support_context_shift(slot.cache_tokens, n_keep, n_discard);
-                if (n_discard > 0 && tokens_support_context_shift(slot.cache_tokens, n_keep, n_discard)) {
-                    context_shift_find_n_tokens(ctx, slot.prompt_tokens, slot.cache_tokens, n_keep,
-                        n_discard, n_kept, n_discard_cache);
-                    LOG_INFO("slot context shift", {
-                                         {"id_slot",         slot.id},
-                                         {"id_task",         slot.id_task},
-                                         {"n_keep",          n_keep},
-                                         {"n_left",          n_left},
-                                         {"n_discard",       n_discard},
-                                         {"n_ctx",           n_ctx},
-                                         {"n_past",          slot.n_past},
-                                         {"n_system_tokens", system_tokens.size()},
-                                         {"n_cache_tokens",  slot.cache_tokens.size()}
-                        });
-                    slot.n_discarded_prompt = slot.n_discarded_prompt + n_discard;
-                    slot.n_kept_prompt = n_keep;
-                    discard_n_kv_and_cache_tokens(ctx, slot, n_kept, n_discard_cache);
-                    slot.n_past -= n_discard_cache;
-                    slot.truncated = true;
+    // --kv-unified: slots share the whole KV pool instead of fixed quotas, so per-slot
+    // n_ctx no longer guards against the *pool* filling up. Before this iteration's batch
+    // is built (positions are assigned after this point, so shifting here is safe), make
+    // sure there is headroom for up to n_batch new tokens by context-shifting the
+    // processing slot with the most cached tokens until the pool has room.
+    if (params_base.kv_unified && params_base.ctx_shift) {
+        const int32_t pool = (int32_t) llama_n_ctx(ctx);
+        const int32_t headroom = std::min((int32_t) params_base.n_batch, pool / 2);
+        int guard = 2 * (int) slots.size() + 1;
+        while (guard-- > 0) {
+            const int32_t used = llama_get_kv_cache_used_cells(ctx);
+            if (used + headroom <= pool) {
+                break;
+            }
+            // stage 1: evict the least-recently-used *idle* slot's retained prompt cache
+            if (evict_idle_slot_cache()) {
+                continue;
+            }
+            // stage 2: context-shift the biggest processing slot. Only slots that finished
+            // prompt ingestion are safe to shift here; a slot mid-prompt has partial cache
+            // bookkeeping that a shift would corrupt.
+            server_slot * victim = nullptr;
+            for (server_slot & s : slots) {
+                if (s.is_processing() && s.ga_n == 1 && s.n_past >= s.n_prompt_tokens &&
+                    (!victim || s.cache_tokens.size() > victim->cache_tokens.size())) {
+                    victim = &s;
                 }
-
+            }
+            if (!victim || !shift_slot_context(*victim) ||
+                llama_get_kv_cache_used_cells(ctx) >= used) {
+                // nothing shiftable, or the shift freed no cells (token-matching edge
+                // case): stop rather than spin; decode will surface an error if truly full
+                break;
             }
         }
     }
@@ -4433,6 +4504,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
         const int ret = server_decode(ctx, batch_view);
         if (ret != 0) {
+            // --kv-unified: the shared pool ran out of cells mid-batch. Idle slots hold no
+            // entries in the current batch, so evicting their retained caches here is safe;
+            // retry the same batch after freeing. Bounded: each eviction empties a slot, so
+            // this fires at most n_slots times before falling through to the normal path.
+            if (params_base.kv_unified && ret == 1 && evict_idle_slot_cache()) {
+                i -= n_batch;
+                continue;
+            }
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;
                 if (ret == user_cancel) {

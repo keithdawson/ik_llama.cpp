@@ -2235,6 +2235,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.numa_bind_compute = true;
         return true;
     }
+    if (arg == "--kv-unified" || arg == "-kvu") {
+        params.kv_unified = true;
+        return true;
+    }
     if (arg == "-dev" || arg == "--device") {
         CHECK_ARG
         std::string value(argv[i]);
@@ -3214,6 +3218,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-dt,   --defrag-thold N",       "KV cache defragmentation threshold (default: %.1f, < 0 - disabled)", (double)params.defrag_thold });
     options.push_back({ "*",           "-mea,  --max-extra-alloc",      "Max extra VRAM allocation per GPU (default: %d)", params.max_extra_alloc_MiB});
     options.push_back({ "*",           "-np,   --parallel N",           "number of parallel sequences to decode (default: %d)", params.n_parallel });
+    options.push_back({ "server",      "-kvu,  --kv-unified",           "server slots share the KV pool elastically (any slot may grow up to the full\n"
+                                                                        "context; the largest slot is context-shifted under pool pressure) instead of\n"
+                                                                        "fixed n_ctx/n_parallel quotas (default: disabled)" });
     options.push_back({ "*",           "-ns,   --sequences N",          "number of sequences to decode (default: %d)", params.n_sequences });
     options.push_back({ "*",           "-cb,   --cont-batching",        "enable continuous batching (a.k.a dynamic batching) (default: %s)", params.cont_batching ? "enabled" : "disabled" });
     options.push_back({ "*",           "-nocb, --no-cont-batching",     "disable continuous batching" });

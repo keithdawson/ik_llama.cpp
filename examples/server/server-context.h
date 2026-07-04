@@ -360,6 +360,15 @@ struct server_context {
 
     void context_shift();
 
+    // shift one slot's context now (n_keep + discard policy); returns false when the
+    // slot's tokens don't support shifting. Used by context_shift() and, with
+    // --kv-unified, by the shared-pool pressure handling.
+    bool shift_slot_context(server_slot & slot);
+
+    // --kv-unified: evict the LRU idle slot's retained prompt cache from the shared KV
+    // pool; returns false when no idle slot holds cells.
+    bool evict_idle_slot_cache();
+
     void add_sampled_tokens();
 
     void batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type);
