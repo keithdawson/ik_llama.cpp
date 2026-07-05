@@ -95,6 +95,13 @@ vim-enhanced
 htop
 ccache
 epel-release
+# selinux policy set: real servers have these, but conditional (rich) deps like
+# flatpak's "flatpak-selinux if selinux-policy-targeted" only surface at install
+# time on the target - include the providers so those chains always resolve
+selinux-policy
+selinux-policy-targeted
+flatpak-selinux
+container-selinux
 EOF
 
 EXTRA_PKGS=""
@@ -120,9 +127,6 @@ if [ "$WITH_NVCTK" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------- resolver container
-DL_FLAGS="--resolve --alldeps"
-[ "$DRY" = 1 ] && DL_FLAGS="$DL_FLAGS --urls"
-
 CONTAINER_SCRIPT=$(cat <<EOS
 set -euo pipefail
 dnf -y -q install dnf-plugins-core createrepo_c epel-release >/dev/null
@@ -143,12 +147,47 @@ if [ -n "${EXTRA_PKGS// }" ]; then
     fi
 fi
 echo "== resolving: base packages +${EXTRA_PKGS:-}"
-dnf -y download $DL_FLAGS --destdir /out/rpms \$(grep -v '^#' /out/packages-base.txt) $EXTRA_PKGS
-if [ "$DRY" != 1 ]; then
-    cp -r /etc/pki/rpm-gpg /out/gpg-keys 2>/dev/null || true
-    createrepo_c --general-compress-type=gz /out/rpms
-    echo "== repo created: \$(ls /out/rpms/*.rpm | wc -l) RPMs, \$(du -sh /out/rpms | cut -f1)"
+dnf -y download --resolve --alldeps --urls \$(grep -v '^#' /out/packages-base.txt) $EXTRA_PKGS \
+    | grep -E '^https?://' | awk -F/ '!seen[\$NF]++' > /tmp/urls.txt
+echo "== resolved \$(wc -l < /tmp/urls.txt) packages"
+if [ "$DRY" = 1 ]; then
+    cat /tmp/urls.txt
+    exit 0
 fi
+# Download with curl instead of dnf: NVIDIA's CDN intermittently breaks HTTP/2 streams
+# on the multi-hundred-MB CUDA RPMs, and curl gives us HTTP/1.1 + retries + resumability
+# (existing complete files are skipped, so re-running continues where it left off).
+cd /out/rpms
+fetch() {
+    local f=\${1##*/}
+    [ -s "\$f" ] && return 0
+    if curl -sfL --retry 5 --retry-delay 3 --http1.1 -o "\$f.part" "\$1"; then
+        mv "\$f.part" "\$f"
+    else
+        rm -f "\$f.part"
+        echo "RETRY-LATER \$1"
+        return 1
+    fi
+}
+export -f fetch
+FAILED=0
+xargs -a /tmp/urls.txt -P 4 -n 1 -I{} bash -c 'fetch "{}"' || FAILED=1
+if [ "\$FAILED" = 1 ]; then
+    echo "== second pass over stragglers (serial)"
+    while read -r url; do
+        f=\${url##*/}
+        [ -s "\$f" ] || curl -fL --retry 8 --retry-delay 5 --http1.1 -o "\$f" "\$url"
+    done < /tmp/urls.txt
+fi
+rm -f ./*.part
+MISSING=0
+while read -r url; do
+    [ -s "\${url##*/}" ] || { echo "MISSING: \$url"; MISSING=1; }
+done < /tmp/urls.txt
+[ "\$MISSING" = 0 ] || { echo "== some packages failed to download; re-run to resume"; exit 1; }
+cp -r /etc/pki/rpm-gpg /out/gpg-keys 2>/dev/null || true
+createrepo_c --general-compress-type=gz /out/rpms
+echo "== repo created: \$(ls /out/rpms/*.rpm | wc -l) RPMs, \$(du -sh /out/rpms | cut -f1)"
 EOS
 )
 
