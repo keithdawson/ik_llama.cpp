@@ -288,6 +288,34 @@ Components: base toolchain + tooling$([ "$CUDA_VER" != none ] && echo ", CUDA to
 The installer only reads from the bundled repo (network is never touched).
 Package list: packages-base.txt; full RPM inventory: MANIFEST.txt.
 
+## Using a newer NVIDIA driver instead of the bundled one
+
+If you are bringing your own driver local-repo RPM (e.g.
+nvidia-driver-local-repo-rhel9-595.xx for CUDA 13.x-era features like NVFP4 on
+Blackwell), SKIP this kit's driver component so the two repos never fight:
+
+    cd offline-kit
+    rm HAS_DRIVER          # install.sh will now leave the driver alone
+    sudo ./install.sh      # toolchain + CUDA 12.9 toolkit + docker + nvctk
+    sudo rpm -i nvidia-driver-local-repo-rhel9-595.*.rpm
+    sudo dnf install nvidia-open   # OPEN modules only - proprietary kmod has no Blackwell support
+    reboot
+
+Layering notes:
+
+- The driver gates the ceiling, not the floor: a 595 (13.x-era) driver runs
+  binaries built with any older toolkit, so llama built against the bundled
+  CUDA toolkit needs nothing else. Driver repos and toolkit repos don't collide.
+- vLLM (and other containers) bring their OWN CUDA runtime; the host only needs
+  the driver. There is no reason to install a 13.x toolkit on the host.
+- The dkms kernel-matching caveat applies to YOUR driver too: kernel-devel must
+  match the running kernel. If it doesn't, install the kit's bundled kernel,
+  reboot into it, then install the driver.
+- One r59x open driver covers a mixed Blackwell + Ada + Ampere box (Turing and
+  newer; the r580 support drops were Maxwell/Pascal/Volta only).
+- With many GPUs, pin every service by UUID (nvidia-smi -L), never by index:
+  CUDA_VISIBLE_DEVICES=GPU-<uuid>. Indices can reorder across boots/drivers.
+
 ## Notes
 
 - RPMs resolved against a minimal Rocky 9 container, so the closure is a superset
