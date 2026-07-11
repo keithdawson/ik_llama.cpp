@@ -122,9 +122,18 @@ only expert tensors get mirrored — both verified. Config: `configs/gpu-hybrid.
 (currently the Qwen1.5-MoE model: **gemma-4 produces garbage on any CUDA build of this
 fork** — CPU-only builds are fine; needs upstream gemma-4 fixes cherry-picked).
 
-Known local result: in hybrid mode mirror costs ~5% PP (scheduling overhead with bursty
-CPU expert work) and TG is a wash locally; per-node resolve counters also show a ~17%
-node imbalance during hybrid PP — both worth revisiting on real hardware.
+**Hybrid rule: set `OMP_WAIT_POLICY=PASSIVE` whenever mirror runs with a GPU.**
+Measured on gemma (testbed, 8 cores): default mirror was -12% PP / -5% TG vs no-numa
+because the pinned OMP workers spin-wait on their cores while the GPU runs, starving
+the CUDA driver/scheduler thread. With PASSIVE, mirror+GPU is **+7.6% TG** over
+no-numa (27.55 vs 25.61 t/s, ±0.15) and PP is within -3.6%. The control matters:
+PASSIVE *without* mirror collapses TG by -36% (unpinned sleeping threads wake on
+random cores) — the win is the pinned+yielding combination. Reducing `-t` by one
+(leaving a core for the driver) is a weaker alternative (+4.8% TG at `-t 7`).
+
+Per-node resolve counters show a ~20-25% node0-biased count skew during hybrid PP —
+that is low-parallelism ops (nth < n_threads) always landing on the lowest thread ids
+(= node 0), not a data-placement bug (fallbacks stay 0).
 
 ## Experiment log convention
 
