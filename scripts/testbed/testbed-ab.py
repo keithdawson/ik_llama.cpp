@@ -43,7 +43,7 @@ DEFAULT_PROMPT = ("Write a detailed essay about the history of computing, starti
 RE_TIMING = re.compile(
     r"llama_print_timings:\s*(prompt eval|eval)\s+time\s*=.*\(\s*[\d.]+\s*ms per token,\s*([\d.]+)\s*tokens per second")
 RE_LOAD = re.compile(r"llama_print_timings:\s*load time\s*=\s*([\d.]+)\s*ms")
-RE_STAT = re.compile(r"numa_stats:\s*(.*)$")
+RE_STAT = re.compile(r"numa_stats:\s*(.*)$", re.MULTILINE)
 
 
 def parse_llama_output(text):
@@ -225,7 +225,12 @@ def smoke_run(binary, model, extra_args, env_overrides, n_predict=32):
     r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         raise RuntimeError("smoke run failed (%d): %s\n%s" % (r.returncode, " ".join(cmd), r.stderr[-2000:]))
-    return r.stdout, r.stderr
+    # ggml_numa_init banners go to stdout; move them over to the log side so the identity
+    # checks compare only the generated text while banner checks still see them
+    kept, moved = [], []
+    for l in r.stdout.splitlines():
+        (moved if l.startswith("ggml_numa_init:") else kept).append(l)
+    return "\n".join(kept), r.stderr + "\n" + "\n".join(moved)
 
 
 def cmd_smoke(args):
