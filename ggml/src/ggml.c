@@ -4575,6 +4575,15 @@ static GGML_THREAD_LOCAL int tl_numa_node = 0; // this thread's NUMA node (set i
 // ---------------------------------------------------------------------------
 static int g_numa_stats_level = 0; // 0=off, 1=dump at exit, 2=also dump+reset per llama_print_timings
 
+// GGML_NUMA_NT_COPY=1: use non-temporal stores in the explicit cross-node copies so populating
+// a multi-GiB mirror streams at DRAM write bandwidth instead of evicting the entire L3 (E5)
+static bool g_numa_nt_copy = false;
+
+// GGML_NUMA_HIER_BATCH_MAX: batches larger than this use the flat barrier, smaller ones the
+// NUMA-hierarchical barrier when it's active. 32 matches the original hardcoded gate; negative
+// values mean "always hierarchical" (E3 sweep knob)
+static int g_numa_hier_batch_max = 32;
+
 #if defined(__gnu_linux__)
 struct ggml_numa_stats_node {
     atomic_ullong resolve_hit;      // ggml_numa_tensor_data served this node's mirror copy
@@ -4697,7 +4706,8 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     // prompt processing (large batch) is compute-bound; keep its original barrier. Only token
     // generation (small batch) was barrier-bound, so that's the only path the hierarchical
     // barrier replaces — applying it to PP just adds 2-level latency with no contention to save.
-    if (shared && shared->n_batch > 32) {
+    // GGML_NUMA_HIER_BATCH_MAX moves the crossover (negative = hierarchical for all batches).
+    if (shared && g_numa_hier_batch_max >= 0 && shared->n_batch > g_numa_hier_batch_max) {
         ggml_barrier_impl(shared);
         return;
     }
@@ -4712,7 +4722,8 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
-    if (g_numa_barrier.active && !(shared && shared->n_batch > 32)) {
+    if (g_numa_barrier.active &&
+        !(shared && g_numa_hier_batch_max >= 0 && shared->n_batch > g_numa_hier_batch_max)) {
         ggml_numa_hier_barrier();
         return;
     }
@@ -4908,6 +4919,17 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
                 g_state.numa.throttle_gbps = v;
                 GGML_PRINT("%s: cross-node copy bandwidth capped at %.1f GB/s (GGML_NUMA_XGMI_GBPS)\n", __func__, v);
             }
+        }
+        s = getenv("GGML_NUMA_NT_COPY");
+        if (s && *s && strcmp(s, "0") != 0) {
+            g_numa_nt_copy = true;
+            GGML_PRINT("%s: non-temporal stores enabled for cross-node copies (GGML_NUMA_NT_COPY)\n", __func__);
+        }
+        s = getenv("GGML_NUMA_HIER_BATCH_MAX");
+        if (s && *s) {
+            g_numa_hier_batch_max = (int) strtol(s, NULL, 10);
+            GGML_PRINT("%s: hierarchical barrier batch gate = %d (GGML_NUMA_HIER_BATCH_MAX%s)\n",
+                       __func__, g_numa_hier_batch_max, g_numa_hier_batch_max < 0 ? ", always hierarchical" : "");
         }
     }
 
@@ -5194,11 +5216,58 @@ struct ggml_numa_copy_slice {
     double       gbps; // this worker's share of GGML_NUMA_XGMI_GBPS (0 = unthrottled)
 };
 
+// non-temporal copy: streaming stores bypass the cache hierarchy, so bulk mirror traffic
+// neither evicts the working set nor bounces through L3 on its way to the other "node"
+static void ggml_numa_nt_memcpy(char * dst, const char * src, size_t n) {
+#if defined(__AVX512F__)
+    size_t i = 0;
+    const size_t mis = (uintptr_t) dst & 63;
+    if (mis) {
+        size_t head = 64 - mis;
+        if (head > n) head = n;
+        memcpy(dst, src, head);
+        i = head;
+    }
+    for (; i + 64 <= n; i += 64) {
+        _mm512_stream_si512((__m512i *) (dst + i), _mm512_loadu_si512((const void *) (src + i)));
+    }
+    _mm_sfence();
+    if (i < n) {
+        memcpy(dst + i, src + i, n - i);
+    }
+#elif defined(__SSE2__)
+    size_t i = 0;
+    const size_t mis = (uintptr_t) dst & 15;
+    if (mis) {
+        size_t head = 16 - mis;
+        if (head > n) head = n;
+        memcpy(dst, src, head);
+        i = head;
+    }
+    for (; i + 16 <= n; i += 16) {
+        _mm_stream_si128((__m128i *) (dst + i), _mm_loadu_si128((const __m128i *) (src + i)));
+    }
+    _mm_sfence();
+    if (i < n) {
+        memcpy(dst + i, src + i, n - i);
+    }
+#else
+    memcpy(dst, src, n);
+#endif
+}
+
+#define GGML_NUMA_NT_MIN (4u << 20) // below this, cache pollution doesn't matter; plain memcpy wins
+
 // copy with the effective bandwidth capped at gbps: 8 MiB bursts, pacing after each so the
 // modeled interconnect stalls are spread over the transfer instead of tacked onto the end
 static void ggml_numa_throttled_memcpy(char * dst, const char * src, size_t size, double gbps) {
+    const bool nt = g_numa_nt_copy && size >= GGML_NUMA_NT_MIN;
     if (gbps <= 0.0) {
-        memcpy(dst, src, size);
+        if (nt) {
+            ggml_numa_nt_memcpy(dst, src, size);
+        } else {
+            memcpy(dst, src, size);
+        }
         return;
     }
     const size_t  burst = 8u << 20;
@@ -5206,7 +5275,11 @@ static void ggml_numa_throttled_memcpy(char * dst, const char * src, size_t size
     size_t done = 0;
     while (done < size) {
         const size_t n = size - done < burst ? size - done : burst;
-        memcpy(dst + done, src + done, n);
+        if (nt) {
+            ggml_numa_nt_memcpy(dst + done, src + done, n);
+        } else {
+            memcpy(dst + done, src + done, n);
+        }
         done += n;
         ggml_numa_paced_wait(done, gbps, t0);
     }

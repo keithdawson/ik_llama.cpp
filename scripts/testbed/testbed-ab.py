@@ -159,13 +159,13 @@ def summarize(records, variants):
         timing = [r["metrics"] for r in records if r["variant"] == name and not r["stats_rep"]]
         stats = next((r.get("numa_stats") for r in records if r["variant"] == name and r["stats_rep"]), None)
         row = {"name": name, "n": len(timing), "stats": stats or {}}
-        for key in ("pp_tps", "tg_tps"):
+        for key in ("pp_tps", "tg_tps", "load_ms"):
             vals = [t[key] for t in timing if t.get(key) is not None]
             row[key] = statistics.mean(vals) if vals else None
             row[key + "_sd"] = statistics.stdev(vals) if len(vals) > 1 else 0.0
         if base is None:
             base = row
-        for key in ("pp_tps", "tg_tps"):
+        for key in ("pp_tps", "tg_tps", "load_ms"):
             row[key + "_delta"] = (100.0 * (row[key] - base[key]) / base[key]
                                    if row[key] and base[key] else None)
         rows.append(row)
@@ -182,14 +182,16 @@ def render_report(out_dir):
         return pat % v if v is not None else "-"
 
     lines = ["## %s (%s)" % (data["config"].get("name", "run"), out_dir), "",
-             "| variant | n | pp t/s | tg t/s | pp Δ% | tg Δ% |",
-             "|---|---|---|---|---|---|"]
+             "| variant | n | pp t/s | tg t/s | load ms | pp Δ% | tg Δ% | load Δ% |",
+             "|---|---|---|---|---|---|---|---|"]
     for r in rows:
-        lines.append("| %s | %d | %s ± %s | %s ± %s | %s | %s |" % (
+        lines.append("| %s | %d | %s ± %s | %s ± %s | %s ± %s | %s | %s | %s |" % (
             r["name"], r["n"],
             fmt(r["pp_tps"]), fmt(r["pp_tps_sd"]),
             fmt(r["tg_tps"]), fmt(r["tg_tps_sd"]),
-            fmt(r["pp_tps_delta"], "%+.2f"), fmt(r["tg_tps_delta"], "%+.2f")))
+            fmt(r["load_ms"], "%.0f"), fmt(r["load_ms_sd"], "%.0f"),
+            fmt(r["pp_tps_delta"], "%+.2f"), fmt(r["tg_tps_delta"], "%+.2f"),
+            fmt(r["load_ms_delta"], "%+.2f")))
     lines.append("")
     counter_keys = ["kv_repl_bytes", "kv_repl_calls", "barriers_hier", "barriers_flat",
                     "throttle_sleep_us", "populate_bytes", "resync_bytes"]
@@ -267,9 +269,12 @@ def cmd_smoke(args):
                         {"GGML_NUMA_FAKE": "2", "GGML_NUMA_XGMI_GBPS": "8"})
     out3, _ = smoke_run(binary, model, ["--numa", "mirror"],
                         {"GGML_NUMA_FAKE": "2", "GGML_NUMA_PIN": "cpu"})
+    out4, _ = smoke_run(binary, model, ["--numa", "mirror"],
+                        {"GGML_NUMA_FAKE": "2", "GGML_NUMA_NT_COPY": "1"})
     check("identity: baseline == mirror", out0 == out1)
     check("identity: mirror == mirror+throttle", out1 == out2)
     check("identity: mirror == mirror+pin", out1 == out3)
+    check("identity: mirror == mirror+nt-copy", out1 == out4)
 
     print("\nsmoke: %s" % ("OK" if not failures else "FAILED: " + ", ".join(failures)))
     return 1 if failures else 0

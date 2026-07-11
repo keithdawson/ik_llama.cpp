@@ -1,0 +1,27 @@
+{
+  "name": "e5-nt-copy",
+  "binary": "/build/main/bin/llama-cli",
+  "model": "/models/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf",
+  "prompt": "Write a detailed essay about the history of computing, starting with mechanical calculators and ending with modern GPUs.",
+  "n_predict": 64,
+  "threads": 8,
+  "reps": 5,
+  "warmup": 1,
+  "common_args": ["-c", "4096", "--no-display-prompt", "--numa", "mirror"],
+  "common_env": {
+    "GGML_NUMA_FAKE": "2",
+    "GGML_NUMA_XGMI_GBPS": "0"
+  },
+  "variants": [
+    {
+      "name": "A-memcpy",
+      "args": [],
+      "env": {}
+    },
+    {
+      "name": "B-nt-copy",
+      "args": [],
+      "env": { "GGML_NUMA_NT_COPY": "1" }
+    }
+  ]
+}
