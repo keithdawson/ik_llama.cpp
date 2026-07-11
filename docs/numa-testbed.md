@@ -122,14 +122,24 @@ only expert tensors get mirrored — both verified. Config: `configs/gpu-hybrid.
 (currently the Qwen1.5-MoE model: **gemma-4 produces garbage on any CUDA build of this
 fork** — CPU-only builds are fine; needs upstream gemma-4 fixes cherry-picked).
 
-**Hybrid rule: set `OMP_WAIT_POLICY=PASSIVE` whenever mirror runs with a GPU.**
-Measured on gemma (testbed, 8 cores): default mirror was -12% PP / -5% TG vs no-numa
-because the pinned OMP workers spin-wait on their cores while the GPU runs, starving
-the CUDA driver/scheduler thread. With PASSIVE, mirror+GPU is **+7.6% TG** over
-no-numa (27.55 vs 25.61 t/s, ±0.15) and PP is within -3.6%. The control matters:
-PASSIVE *without* mirror collapses TG by -36% (unpinned sleeping threads wake on
-random cores) — the win is the pinned+yielding combination. Reducing `-t` by one
-(leaving a core for the driver) is a weaker alternative (+4.8% TG at `-t 7`).
+**Hybrid rule (auto-set by `llama_init_from_gpt_params` when mirror + `-ngl` > 0):
+`OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=25000`.** Setting either env var yourself
+disables the auto-default. The history, measured on gemma (testbed, 8 cores):
+
+| waiting policy (mirror hybrid) | pp vs no-numa | tg vs no-numa |
+|---|---|---|
+| default (long spin) | -12% | -5% (driver starved by spinning pinned workers) |
+| fully PASSIVE (0 spins) | -7…-10% | +4…+8% (every CPU segment pays thread-wake latency) |
+| **PASSIVE + spin 25k (~100 µs)** | **+0.2%** | **+15.9%** (27.9 t/s) |
+| spin 250k | -1.4% | -4% (back toward starvation) |
+
+Controls that pin down the mechanism: PASSIVE *without* mirror collapses TG -36%
+(unpinned sleeping threads wake on random cores) — the win is specifically
+pinned + briefly-spin-then-yield. `GGML_NUMA_RESERVE_CPUS=N[@node]` (drops N CPUs
+from a node's pinning set; the thread block split is CPU-count weighted so the node
+gets proportionally fewer threads) did **not** help locally once waiting was fixed —
+B/C/D within noise on TG, reserve costs PP compute — but on a 96-core socket the
+2-core insurance is nearly free; re-test on the real machine.
 
 Per-node resolve counters show a ~20-25% node0-biased count skew during hybrid PP —
 that is low-parallelism ops (nth < n_threads) always landing on the lowest thread ids

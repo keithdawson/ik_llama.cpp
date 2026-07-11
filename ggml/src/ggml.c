@@ -4904,6 +4904,32 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         }
     }
 
+    // GGML_NUMA_RESERVE_CPUS=N[@node]: drop the last N CPUs from one node's pinning set so
+    // unpinned threads (CUDA driver, backend scheduler, main thread) get dedicated cores
+    // instead of competing with pinned compute threads. Default target is the last node;
+    // pass e.g. 2@0 to reserve on node 0. The thread block split is CPU-count weighted
+    // (ggml_numa_node_first_thread), so the trimmed node automatically gets fewer threads.
+    {
+        const char * s = getenv("GGML_NUMA_RESERVE_CPUS");
+        if (s && *s && g_state.numa.n_nodes > 1) {
+            char * end = NULL;
+            long   cnt  = strtol(s, &end, 10);
+            long   nidx = (long) g_state.numa.n_nodes - 1;
+            if (end && *end == '@') {
+                nidx = strtol(end + 1, NULL, 10);
+            }
+            if (cnt > 0 && nidx >= 0 && nidx < (long) g_state.numa.n_nodes) {
+                struct ggml_numa_node * node = &g_state.numa.nodes[nidx];
+                const uint32_t drop = cnt < (long) node->n_cpus ? (uint32_t) cnt : node->n_cpus - 1; // keep >= 1
+                node->n_cpus -= drop;
+                GGML_PRINT("%s: reserved %u CPUs on node %ld for unpinned threads (GGML_NUMA_RESERVE_CPUS)\n",
+                           __func__, drop, nidx);
+            } else if (cnt != 0) {
+                fprintf(stderr, "%s: ignoring GGML_NUMA_RESERVE_CPUS=%s (want N or N@node)\n", __func__, s);
+            }
+        }
+    }
+
     // testbed knobs, parsed here so they ride along with any --numa strategy:
     // GGML_NUMA_STATS=1 dumps mirror-path counters at exit (=2: also per llama_print_timings);
     // GGML_NUMA_XGMI_GBPS caps explicit cross-node copies to model the socket interconnect.
@@ -5029,6 +5055,29 @@ bool ggml_numa_get_bind_compute(void) {
     return g_state.numa.bind_compute && g_state.numa.primary_gpu_node >= 0;
 }
 
+// First thread index of node k under the CPU-weighted block split (k == n_nodes -> nth).
+// Weighted by each node's pinnable CPU count so an asymmetric topology (e.g. cores held
+// back via GGML_NUMA_RESERVE_CPUS for the CUDA driver) gets proportionally fewer threads;
+// with symmetric nodes this is exactly the historical even split ceil(k*nth/n).
+static int ggml_numa_node_first_thread(int k, int nth) {
+    const int n = (int) g_state.numa.n_nodes;
+    if (n <= 1) {
+        return k <= 0 ? 0 : nth;
+    }
+    uint64_t total = 0;
+    for (int j = 0; j < n; ++j) {
+        total += g_state.numa.nodes[j].n_cpus;
+    }
+    if (total == 0) { // topology without CPU lists: fall back to the even split
+        return (int) (((uint64_t) k * nth + n - 1) / n);
+    }
+    uint64_t cum = 0;
+    for (int j = 0; j < k && j < n; ++j) {
+        cum += g_state.numa.nodes[j].n_cpus;
+    }
+    return (int) (((uint64_t) nth * cum + total - 1) / total);
+}
+
 // block split of [0, nth) threads across the detected NUMA nodes. Used by BOTH the thread
 // affinity pinning and the per-thread weight-pointer redirection, so they always agree.
 int ggml_numa_node_for_thread(int ith, int nth) {
@@ -5036,9 +5085,12 @@ int ggml_numa_node_for_thread(int ith, int nth) {
     if (n <= 1 || nth <= 0) {
         return 0;
     }
-    int node = (ith * n) / nth;
-    if (node >= n) node = n - 1;
-    return node;
+    for (int k = 0; k < n - 1; ++k) {
+        if (ith < ggml_numa_node_first_thread(k + 1, nth)) {
+            return k;
+        }
+    }
+    return n - 1;
 }
 
 int ggml_numa_stats_level(void) {
@@ -5399,9 +5451,9 @@ static void ggml_numa_barrier_setup(int n_threads) {
     }
     int leaders = 0;
     for (int k = 0; k < n; ++k) {
-        // contiguous block split, identical to ggml_numa_node_for_thread(ith,nth) = (ith*n)/nth
-        const int first_k  = ( k      * n_threads + n - 1) / n;
-        const int first_k1 = ((k + 1) * n_threads + n - 1) / n;
+        // contiguous block split, identical to ggml_numa_node_for_thread()
+        const int first_k  = ggml_numa_node_first_thread(k,     n_threads);
+        const int first_k1 = ggml_numa_node_first_thread(k + 1, n_threads);
         g_numa_barrier.node_nth[k] = first_k1 - first_k;
         if (g_numa_barrier.node_nth[k] > 0) {
             ++leaders;
@@ -27186,8 +27238,7 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
     // CPUs outside the process's original affinity mask (numactl/cgroup) are skipped.
     bool pinned_single = false;
     if (g_state.numa.pin_cpu && g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR) {
-        const int n = (int) g_state.numa.n_nodes;
-        const int first = (node_num * n_threads + n - 1) / n; // first thread of this node's block
+        const int first = ggml_numa_node_first_thread(node_num, n_threads); // first thread of this node's block
         const int local = thread_n - first;
         uint32_t allowed[GGML_NUMA_MAX_CPUS];
         uint32_t n_allowed = 0;
