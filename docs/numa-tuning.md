@@ -25,6 +25,44 @@ Build note: make sure the build has **OpenMP** enabled (it is by default — ver
 Without OpenMP, worker threads are created and joined on *every* graph compute, which
 is real per-token overhead at high thread counts.
 
+## Waiting policy (mirror + GPU offload)
+
+When `--numa mirror` runs with GPU layers, the pinned OpenMP workers must spin only
+*briefly* and then sleep while the GPU works: spinning through GPU segments starves the
+CUDA driver thread (measured -12% pp / -5% tg on the testbed), while fully passive
+waiting makes every CPU expert segment pay thread-wake latency (~-10% pp). The binary
+therefore **auto-sets `OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=25000`** whenever
+mirror + `-ngl > 0` and *neither* variable is already in the environment (it logs one
+line when it does). 25000 (~100 µs of spinning) was tuned on a desktop Zen 5 — tune it
+once for this machine:
+
+```sh
+./scripts/tune-spincount.sh -m /path/model.gguf -t <your -t> -- <your real serving flags>
+```
+
+The script sweeps `GOMP_SPINCOUNT` over {0, 5k, 10k, 25k, 50k, 100k, 250k} against a
+~3k-token prompt and prints a pp/tg table plus the best value.
+
+**What to do with the answer:** pick the spin count with the best tg whose pp is also
+within noise of the best pp row (they usually agree; if not, favor tg for a serving
+box). If it's 25000, do nothing — the built-in default already matches. If it differs,
+set both variables explicitly in the serving environment — an explicit setting disables
+the auto-default:
+
+```sh
+# wrapper script / shell
+export OMP_WAIT_POLICY=PASSIVE GOMP_SPINCOUNT=<best>
+
+# systemd unit
+Environment=OMP_WAIT_POLICY=PASSIVE GOMP_SPINCOUNT=<best>
+
+# docker compose
+environment: { OMP_WAIT_POLICY: PASSIVE, GOMP_SPINCOUNT: "<best>" }
+```
+
+Re-tune if the thread count, model, or GPU/CPU split changes materially — the optimum
+tracks how long the per-layer GPU segments are relative to thread wake latency.
+
 ## 1. Verifying placement: `numastat` and `numa_maps`
 
 ### System-wide allocation counters
