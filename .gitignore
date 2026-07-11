@@ -163,3 +163,4 @@ a.out.*
 .dev
 .github
 numa-ab-results/
+testbed-results/
