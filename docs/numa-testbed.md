@@ -107,6 +107,25 @@ free-RAM check reads `/proc/meminfo` (the whole WSL2 VM) and cannot see cgroup l
 All are inert when unset; a build with these changes and no env vars behaves identically
 to one without them.
 
+## GPU-hybrid mode (Pandora shape: dense on GPU, experts on CPU)
+
+Build the CUDA image and tree (needs `--gpus all` even for the build, so `libcuda` links):
+
+```powershell
+docker build -f docker/numa-testbed.Containerfile --build-arg BASE=nvidia/cuda:12.8.0-devel-ubuntu24.04 -t ik-numa-testbed-cuda .
+docker run --rm --gpus all -v ${PWD}:/src -v ik-build:/build -v ik-ccache:/ccache ik-numa-testbed-cuda bash -lc "cmake -B /build/cuda -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 <zen flags> && cmake --build /build/cuda -j16"
+```
+
+Canonical hybrid flags: `-ngl 99 -ot exps=CPU -fa on --numa mirror --numa-gpu-node 1`
+(this fork's `-fa` requires a value). With KV on the GPU, `kv_repl_bytes` must be 0 and
+only expert tensors get mirrored — both verified. Config: `configs/gpu-hybrid.json`
+(currently the Qwen1.5-MoE model: **gemma-4 produces garbage on any CUDA build of this
+fork** — CPU-only builds are fine; needs upstream gemma-4 fixes cherry-picked).
+
+Known local result: in hybrid mode mirror costs ~5% PP (scheduling overhead with bursty
+CPU expert work) and TG is a wash locally; per-node resolve counters also show a ~17%
+node imbalance during hybrid PP — both worth revisiting on real hardware.
+
 ## Experiment log convention
 
 One directory per experiment under `testbed-results/`, plus a row appended to
