@@ -4595,6 +4595,7 @@ static struct {
     struct ggml_numa_stats_node node[GGML_NUMA_MAX_NODES];
     atomic_ullong populate_bytes;    // all ggml_numa_memcpy_to_node traffic (mirror load + resync)
     atomic_ullong populate_calls;
+    atomic_ullong populate_us;       // wall time inside ggml_numa_memcpy_to_node (copy only, no disk I/O)
     atomic_ullong resync_bytes;      // subset of populate_*: ggml_numa_tensor_resync traffic
     atomic_ullong resync_calls;
     atomic_ullong kv_repl_bytes;     // per-token KV fan-out in ggml_numa_replicate_kv_write
@@ -5057,9 +5058,10 @@ void ggml_numa_stats_print(void) {
                 (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].resolve_hit,      memory_order_relaxed),
                 (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].resolve_fallback, memory_order_relaxed));
     }
-    fprintf(stderr, "numa_stats: populate_bytes=%llu populate_calls=%llu resync_bytes=%llu resync_calls=%llu\n",
+    fprintf(stderr, "numa_stats: populate_bytes=%llu populate_calls=%llu populate_us=%llu resync_bytes=%llu resync_calls=%llu\n",
             (unsigned long long) atomic_load_explicit(&g_numa_stats.populate_bytes, memory_order_relaxed),
             (unsigned long long) atomic_load_explicit(&g_numa_stats.populate_calls, memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.populate_us,    memory_order_relaxed),
             (unsigned long long) atomic_load_explicit(&g_numa_stats.resync_bytes,   memory_order_relaxed),
             (unsigned long long) atomic_load_explicit(&g_numa_stats.resync_calls,   memory_order_relaxed));
     fprintf(stderr, "numa_stats: kv_repl_bytes=%llu kv_repl_calls=%llu barriers_hier=%llu barriers_flat=%llu throttle_sleep_us=%llu\n",
@@ -5076,6 +5078,7 @@ void ggml_numa_stats_print(void) {
         }
         atomic_store_explicit(&g_numa_stats.populate_bytes,    0ULL, memory_order_relaxed);
         atomic_store_explicit(&g_numa_stats.populate_calls,    0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.populate_us,       0ULL, memory_order_relaxed);
         atomic_store_explicit(&g_numa_stats.resync_bytes,      0ULL, memory_order_relaxed);
         atomic_store_explicit(&g_numa_stats.resync_calls,      0ULL, memory_order_relaxed);
         atomic_store_explicit(&g_numa_stats.kv_repl_bytes,     0ULL, memory_order_relaxed);
@@ -5310,6 +5313,7 @@ static void * ggml_numa_copy_worker(void * arg) {
 
 void ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int node) {
 #if defined(__gnu_linux__)
+    const int64_t t_enter = g_numa_stats_level ? ggml_time_us() : 0;
     if (g_numa_stats_level) {
         GGML_NUMA_STAT_ADD(populate_bytes, size);
         GGML_NUMA_STAT_ADD(populate_calls, 1);
@@ -5321,6 +5325,9 @@ void ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int nod
     }
     if (size < GGML_NUMA_COPY_MIN_PARALLEL || nthr <= 1 || g_state.numa.n_nodes < 2) {
         ggml_numa_throttled_memcpy((char *) dst, (const char *) src, size, gbps);
+        if (g_numa_stats_level) {
+            GGML_NUMA_STAT_ADD(populate_us, ggml_time_us() - t_enter);
+        }
         return;
     }
     pthread_t threads[GGML_NUMA_COPY_MAX_THREADS];
@@ -5351,6 +5358,9 @@ void ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int nod
     }
     for (int i = 0; i < started; ++i) {
         pthread_join(threads[i], NULL);
+    }
+    if (g_numa_stats_level) {
+        GGML_NUMA_STAT_ADD(populate_us, ggml_time_us() - t_enter);
     }
 #else
     UNUSED(node);

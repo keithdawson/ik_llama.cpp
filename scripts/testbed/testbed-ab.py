@@ -194,7 +194,7 @@ def render_report(out_dir):
             fmt(r["load_ms_delta"], "%+.2f")))
     lines.append("")
     counter_keys = ["kv_repl_bytes", "kv_repl_calls", "barriers_hier", "barriers_flat",
-                    "throttle_sleep_us", "populate_bytes", "resync_bytes"]
+                    "throttle_sleep_us", "populate_bytes", "populate_us", "resync_bytes"]
     node_keys = sorted({k for r in rows for k in r["stats"] if k.startswith("node")})
     if any(r["stats"] for r in rows):
         lines += ["| variant | " + " | ".join(node_keys + counter_keys) + " |",
