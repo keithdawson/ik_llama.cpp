@@ -145,6 +145,18 @@ Per-node resolve counters show a ~20-25% node0-biased count skew during hybrid P
 that is low-parallelism ops (nth < n_threads) always landing on the lowest thread ids
 (= node 0), not a data-placement bug (fallbacks stay 0).
 
+## Experiment results so far (testbed)
+
+| Exp | Verdict | Numbers |
+|---|---|---|
+| E5 NT copies | reject locally; re-test on Pandora (`GGML_NUMA_NT_COPY=1`) | tg unchanged, load noise |
+| E3 hier barrier for PP | keep gate at 32 locally; sweep `GGML_NUMA_HIER_BATCH_MAX` on Pandora | hier-for-PP -3% pp |
+| Waiting policy | **rolled up** (auto PASSIVE + spin 25k with GPU) | +0.2% pp / +15.9% tg vs no-numa |
+| Reserve CPUs | no local win; re-test on Pandora (`GGML_NUMA_RESERVE_CPUS=2@<gpu node>`) | within noise |
+| E10 hugetlb | reject locally (`GGML_NUMA_HUGETLB` stays, default off) — THP already optimal on a fresh box; hedge for long-uptime fragmentation | pp -0.7%, **tg -6.5%**, load -38% |
+| E6 copy threads | default correct (max threads, clamped to node CPUs); sweep `GGML_NUMA_COPY_THREADS` 16→32 on Pandora | 1t 2.4 / 2t 10 / 4t 14.6 GB/s |
+| E11 expert census | expert traffic is **nearly uniform** (gemma-4: 128 experts, ~8 active/token, CV≈0.33, top-8 experts carry 10.6%; greedy 2-way shard = 49.9/50.1) → per-node expert *sharding* is aggregate-balanced and would halve mirror RAM; per-token imbalance (binomial split of ~8 experts) makes it a TG latency risk, so mirror stays right for gemma-class models on a 2.3 TB box; revisit for models whose mirror doesn't fit | `moe_expert_rows` CSV via `GGML_NUMA_STATS=1` |
+
 ## Experiment log convention
 
 One directory per experiment under `testbed-results/`, plus a row appended to
