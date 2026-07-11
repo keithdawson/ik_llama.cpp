@@ -1,0 +1,27 @@
+{
+  "name": "e10-hugetlb",
+  "binary": "/build/main/bin/llama-cli",
+  "model": "/models/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf",
+  "prompt_file": "/src/scripts/testbed/prompts/pp-long.txt",
+  "n_predict": 64,
+  "threads": 8,
+  "reps": 3,
+  "warmup": 1,
+  "common_args": ["-c", "4096", "--no-display-prompt", "--numa", "mirror"],
+  "common_env": {
+    "GGML_NUMA_FAKE": "2",
+    "GGML_NUMA_XGMI_GBPS": "60"
+  },
+  "variants": [
+    {
+      "name": "A-thp",
+      "args": [],
+      "env": {}
+    },
+    {
+      "name": "B-hugetlb",
+      "args": [],
+      "env": { "GGML_NUMA_HUGETLB": "1" }
+    }
+  ]
+}

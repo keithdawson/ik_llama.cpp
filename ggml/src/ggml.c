@@ -4584,6 +4584,42 @@ static bool g_numa_nt_copy = false;
 // values mean "always hierarchical" (E3 sweep knob)
 static int g_numa_hier_batch_max = 32;
 
+// GGML_NUMA_HUGETLB=1: back ggml_numa_alloc with explicit 2 MiB hugetlb pages instead of
+// relying on THP (requires a preallocated vm.nr_hugepages pool; falls back per-allocation)
+static bool g_numa_hugetlb = false;
+
+// GGML_NUMA_COPY_THREADS / GGML_NUMA_COPY_MIN_MB: tune the dest-pinned parallel mirror copy
+// (defaults match the historical 16-thread / 64 MiB threshold)
+#define GGML_NUMA_COPY_MIN_PARALLEL (64u << 20) // below this a single memcpy wins
+#define GGML_NUMA_COPY_MAX_THREADS  16
+static int    g_numa_copy_threads = GGML_NUMA_COPY_MAX_THREADS;
+static size_t g_numa_copy_min     = GGML_NUMA_COPY_MIN_PARALLEL;
+
+#if defined(__gnu_linux__)
+// MoE expert-access census (GGML_NUMA_STATS): per-expert routed-row totals, aggregated over
+// all mul_mat_id ops. Written only by ith==0 inside each op (ops run sequentially), so plain
+// integers are safe. Answers whether expert *sharding* per node could replace mirroring.
+#define GGML_NUMA_MOE_MAX_EXPERTS 512
+static struct {
+    uint64_t rows[GGML_NUMA_MOE_MAX_EXPERTS];
+    uint64_t ops;
+    int      n_expert;
+} g_numa_moe_stats;
+
+static void ggml_numa_moe_stats_add(int n_as, const int64_t * counts) {
+    if (n_as > GGML_NUMA_MOE_MAX_EXPERTS) {
+        n_as = GGML_NUMA_MOE_MAX_EXPERTS;
+    }
+    if (n_as > g_numa_moe_stats.n_expert) {
+        g_numa_moe_stats.n_expert = n_as;
+    }
+    g_numa_moe_stats.ops++;
+    for (int a = 0; a < n_as; ++a) {
+        g_numa_moe_stats.rows[a] += (uint64_t) counts[a];
+    }
+}
+#endif
+
 #if defined(__gnu_linux__)
 struct ggml_numa_stats_node {
     atomic_ullong resolve_hit;      // ggml_numa_tensor_data served this node's mirror copy
@@ -4958,6 +4994,27 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
             GGML_PRINT("%s: hierarchical barrier batch gate = %d (GGML_NUMA_HIER_BATCH_MAX%s)\n",
                        __func__, g_numa_hier_batch_max, g_numa_hier_batch_max < 0 ? ", always hierarchical" : "");
         }
+        s = getenv("GGML_NUMA_HUGETLB");
+        if (s && *s && strcmp(s, "0") != 0) {
+            g_numa_hugetlb = true;
+            GGML_PRINT("%s: explicit 2 MiB hugetlb pages for NUMA allocations (GGML_NUMA_HUGETLB)\n", __func__);
+        }
+        s = getenv("GGML_NUMA_COPY_THREADS");
+        if (s && *s) {
+            long v = strtol(s, NULL, 10);
+            if (v >= 1 && v <= GGML_NUMA_COPY_MAX_THREADS) {
+                g_numa_copy_threads = (int) v;
+            } else {
+                fprintf(stderr, "%s: ignoring GGML_NUMA_COPY_THREADS=%s (want 1..%d)\n", __func__, s, GGML_NUMA_COPY_MAX_THREADS);
+            }
+        }
+        s = getenv("GGML_NUMA_COPY_MIN_MB");
+        if (s && *s) {
+            long v = strtol(s, NULL, 10);
+            if (v >= 1) {
+                g_numa_copy_min = (size_t) v << 20;
+            }
+        }
     }
 
     if (!g_state.numa.fake && ggml_is_numa()) {
@@ -5122,8 +5179,25 @@ void ggml_numa_stats_print(void) {
             (unsigned long long) atomic_load_explicit(&g_numa_stats.barriers_hier,     memory_order_relaxed),
             (unsigned long long) atomic_load_explicit(&g_numa_stats.barriers_flat,     memory_order_relaxed),
             (unsigned long long) atomic_load_explicit(&g_numa_stats.throttle_sleep_us, memory_order_relaxed));
+    if (g_numa_moe_stats.n_expert > 0) {
+        uint64_t total = 0, mx = 0;
+        for (int a = 0; a < g_numa_moe_stats.n_expert; ++a) {
+            total += g_numa_moe_stats.rows[a];
+            if (g_numa_moe_stats.rows[a] > mx) mx = g_numa_moe_stats.rows[a];
+        }
+        const double mean = g_numa_moe_stats.n_expert > 0 ? (double) total / g_numa_moe_stats.n_expert : 0.0;
+        fprintf(stderr, "numa_stats: moe_ops=%llu n_expert=%d expert_rows_total=%llu expert_rows_max=%llu max_over_mean=%.2f\n",
+                (unsigned long long) g_numa_moe_stats.ops, g_numa_moe_stats.n_expert,
+                (unsigned long long) total, (unsigned long long) mx, mean > 0 ? (double) mx / mean : 0.0);
+        fprintf(stderr, "numa_stats: moe_expert_rows=");
+        for (int a = 0; a < g_numa_moe_stats.n_expert; ++a) {
+            fprintf(stderr, "%s%llu", a ? "," : "", (unsigned long long) g_numa_moe_stats.rows[a]);
+        }
+        fprintf(stderr, "\n");
+    }
     if (g_numa_stats_level >= 2) {
         // per-phase mode: caller dumps after each llama_print_timings, so restart the window
+        memset(&g_numa_moe_stats, 0, sizeof(g_numa_moe_stats));
         for (uint32_t k = 0; k < GGML_NUMA_MAX_NODES; ++k) {
             atomic_store_explicit(&g_numa_stats.node[k].resolve_hit,      0ULL, memory_order_relaxed);
             atomic_store_explicit(&g_numa_stats.node[k].resolve_fallback, 0ULL, memory_order_relaxed);
@@ -5197,10 +5271,37 @@ static long ggml_sys_mbind(void * addr, unsigned long len, int mode,
 
 #define GGML_NUMA_HUGE_ALIGN ((size_t) (2u << 20)) // 2 MiB, for transparent huge pages
 
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
+#endif
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+#endif
+
 void * ggml_numa_alloc(size_t size, int node) {
 #if defined(__gnu_linux__)
     size_t aligned = (size + GGML_NUMA_HUGE_ALIGN - 1) & ~(GGML_NUMA_HUGE_ALIGN - 1);
-    void * p = mmap(NULL, aligned, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void * p = MAP_FAILED;
+    if (g_numa_hugetlb) {
+        // explicit 2 MiB pages from the hugetlb pool: guaranteed huge mappings (no THP
+        // best-effort), at the cost of requiring vm.nr_hugepages to be preallocated
+        p = mmap(NULL, aligned, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+        if (p == MAP_FAILED) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "%s: hugetlb mmap of %zu bytes failed (pool exhausted or vm.nr_hugepages unset), falling back to THP\n",
+                        __func__, aligned);
+            }
+        }
+    }
+    if (p == MAP_FAILED) {
+        p = mmap(NULL, aligned, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     if (p == MAP_FAILED) {
         return NULL;
     }
@@ -5360,9 +5461,6 @@ static void * ggml_numa_copy_worker(void * arg) {
 }
 #endif
 
-#define GGML_NUMA_COPY_MIN_PARALLEL (64u << 20) // below this a single memcpy wins
-#define GGML_NUMA_COPY_MAX_THREADS  16
-
 void ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int node) {
 #if defined(__gnu_linux__)
     const int64_t t_enter = g_numa_stats_level ? ggml_time_us() : 0;
@@ -5371,11 +5469,11 @@ void ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int nod
         GGML_NUMA_STAT_ADD(populate_calls, 1);
     }
     const double gbps = g_state.numa.throttle_gbps;
-    int nthr = GGML_NUMA_COPY_MAX_THREADS;
+    int nthr = g_numa_copy_threads;
     if (node >= 0 && node < (int) g_state.numa.n_nodes && (int) g_state.numa.nodes[node].n_cpus < nthr) {
         nthr = (int) g_state.numa.nodes[node].n_cpus;
     }
-    if (size < GGML_NUMA_COPY_MIN_PARALLEL || nthr <= 1 || g_state.numa.n_nodes < 2) {
+    if (size < g_numa_copy_min || nthr <= 1 || g_state.numa.n_nodes < 2) {
         ggml_numa_throttled_memcpy((char *) dst, (const char *) src, size, gbps);
         if (g_numa_stats_level) {
             GGML_NUMA_STAT_ADD(populate_us, ggml_time_us() - t_enter);
@@ -18238,6 +18336,11 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+#if defined(__gnu_linux__)
+        if (g_numa_stats_level) {
+            ggml_numa_moe_stats_add(n_as, matrix_row_counts); // expert-routing census (E11)
+        }
+#endif
     }
 
     ggml_barrier(params->shared);
@@ -18515,6 +18618,11 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                 matrix_row_counts[i02] += 1;
             }
         }
+#if defined(__gnu_linux__)
+        if (g_numa_stats_level) {
+            ggml_numa_moe_stats_add(n_as, matrix_row_counts); // expert-routing census (E11)
+        }
+#endif
     }
 
     ggml_barrier(params->shared);
