@@ -11220,6 +11220,10 @@ void llama_print_timings(struct llama_context * ctx) {
     LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, timings.t_eval_ms, timings.n_eval, timings.t_eval_ms / timings.n_eval, 1e3 / timings.t_eval_ms * timings.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (timings.t_end_ms - timings.t_start_ms), (timings.n_p_eval + timings.n_eval));
+
+    if (ggml_numa_stats_level() >= 2) {
+        ggml_numa_stats_print(); // GGML_NUMA_STATS=2: per-phase counter window, dump + reset
+    }
 }
 
 void llama_reset_timings(struct llama_context * ctx) {

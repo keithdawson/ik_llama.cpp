@@ -4506,6 +4506,8 @@ struct ggml_numa_nodes {
     int32_t primary_gpu_node; // -1 if not set, else the preferred node for dense GPU interaction
     bool bind_compute; // when primary_gpu_node is set: also bind the sched CPU compute buffers to it
     bool pin_cpu; // GGML_NUMA_PIN=cpu: pin each mirror thread to one specific CPU (CCD/L3 locality)
+    bool fake; // GGML_NUMA_FAKE=N testbed mode: fabricated topology on a 1-node box, mbind disabled
+    double throttle_gbps; // GGML_NUMA_XGMI_GBPS: cap explicit cross-node copies to model the interconnect (0 = off)
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -4564,6 +4566,38 @@ static struct {
 
 static GGML_THREAD_LOCAL int tl_numa_node = 0; // this thread's NUMA node (set in set_numa_thread_affinity)
 
+// ---------------------------------------------------------------------------
+// NUMA-mirror diagnostics (GGML_NUMA_STATS=1|2). Relaxed counters over the mirror
+// paths so a testbed run can attribute traffic: node-local vs fallback pointer
+// resolutions, bytes moved by explicit cross-node copies, barrier flavor counts,
+// and time spent in the GGML_NUMA_XGMI_GBPS pacing (see ggml_numa_paced_wait).
+// Off by default; the hot paths pay one never-taken branch on a cached global.
+// ---------------------------------------------------------------------------
+static int g_numa_stats_level = 0; // 0=off, 1=dump at exit, 2=also dump+reset per llama_print_timings
+
+#if defined(__gnu_linux__)
+struct ggml_numa_stats_node {
+    atomic_ullong resolve_hit;      // ggml_numa_tensor_data served this node's mirror copy
+    atomic_ullong resolve_fallback; // mirrored tensor lacked this node's copy -> used t->data
+    char pad[GGML_NUMA_BARRIER_LINE - 2*sizeof(atomic_ullong)];
+};
+
+static struct {
+    struct ggml_numa_stats_node node[GGML_NUMA_MAX_NODES];
+    atomic_ullong populate_bytes;    // all ggml_numa_memcpy_to_node traffic (mirror load + resync)
+    atomic_ullong populate_calls;
+    atomic_ullong resync_bytes;      // subset of populate_*: ggml_numa_tensor_resync traffic
+    atomic_ullong resync_calls;
+    atomic_ullong kv_repl_bytes;     // per-token KV fan-out in ggml_numa_replicate_kv_write
+    atomic_ullong kv_repl_calls;
+    atomic_ullong barriers_hier;     // hierarchical barrier passes (counted by the global leader)
+    atomic_ullong barriers_flat;     // flat ggml_barrier_impl passes (counted by the last arriver)
+    atomic_ullong throttle_sleep_us; // time spent modeling the interconnect (paced waits)
+} g_numa_stats;
+
+#define GGML_NUMA_STAT_ADD(field, v) atomic_fetch_add_explicit(&g_numa_stats.field, (unsigned long long)(v), memory_order_relaxed)
+#endif
+
 static inline void ggml_numa_spin_pause(void) {
 #if defined(__SSE3__)
     _mm_pause();
@@ -4598,6 +4632,11 @@ static void ggml_numa_hier_barrier(void) {
         if (atomic_fetch_add(&g_numa_barrier.global_arrive, 1) == n_leaders - 1) {
             atomic_store(&g_numa_barrier.global_arrive, 0);
             atomic_fetch_add(&g_numa_barrier.global_release, 1); // release all leaders
+#if defined(__gnu_linux__)
+            if (g_numa_stats_level) {
+                GGML_NUMA_STAT_ADD(barriers_hier, 1);
+            }
+#endif
         } else {
             while (atomic_load(&g_numa_barrier.global_release) == g_old) {
                 ggml_numa_spin_pause();
@@ -4626,6 +4665,11 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) 
         // last thread
         atomic_store(n_barrier, 0);
         atomic_fetch_add(n_barrier_passed, 1);
+#if defined(__gnu_linux__)
+        if (g_numa_stats_level) {
+            GGML_NUMA_STAT_ADD(barriers_flat, 1);
+        }
+#endif
     } else {
         // wait for other threads
         const int n_spin_before_sleep = 100000;
@@ -4721,20 +4765,69 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
     g_state.numa.cpuset = ggml_get_numa_affinity();
 
-    // enumerate nodes
-    while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
-        rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
-        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-        if (stat(path, &st) != 0) { break; }
-        ++g_state.numa.n_nodes;
+    // GGML_NUMA_FAKE=<N>: testbed mode. Fabricate an N-node topology from the CPUs this
+    // process is allowed on (e.g. a docker --cpuset-cpus slice) so the full mirror stack —
+    // per-node copies, thread pinning, hierarchical barrier, KV replication — can be
+    // exercised on a single-node machine. Memory binding is a no-op (see ggml_sys_mbind).
+    uint32_t fake_nodes = 0;
+    {
+        const char * s = getenv("GGML_NUMA_FAKE");
+        if (s && *s) {
+            long v = strtol(s, NULL, 10);
+            if (v >= 2 && v <= GGML_NUMA_MAX_NODES) {
+                fake_nodes = (uint32_t) v;
+            } else if (v != 0) {
+                fprintf(stderr, "%s: ignoring GGML_NUMA_FAKE=%s (want 2..%d)\n", __func__, s, GGML_NUMA_MAX_NODES);
+            }
+        }
     }
 
-    // enumerate CPUs
+    // enumerate nodes
+    if (fake_nodes == 0) {
+        while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
+            rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
+            GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+            if (stat(path, &st) != 0) { break; }
+            ++g_state.numa.n_nodes;
+        }
+    }
+
+    // enumerate CPUs (always the real count: it sizes CPU_ALLOC_SIZE in the pinning code)
     while (g_state.numa.total_cpus < GGML_NUMA_MAX_CPUS) {
         rv = snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u", g_state.numa.total_cpus);
         GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
         if (stat(path, &st) != 0) { break; }
         ++g_state.numa.total_cpus;
+    }
+
+    if (fake_nodes > 0) {
+        // contiguous block split of the allowed CPUs, the same shape as a real per-socket
+        // split and as the thread block split in ggml_numa_node_for_thread()
+        uint32_t allowed[GGML_NUMA_MAX_CPUS];
+        uint32_t n_allowed = 0;
+        for (uint32_t c = 0; c < g_state.numa.total_cpus && n_allowed < GGML_NUMA_MAX_CPUS; ++c) {
+            if (CPU_ISSET(c, &g_state.numa.cpuset)) {
+                allowed[n_allowed++] = c;
+            }
+        }
+        if (n_allowed < fake_nodes) {
+            fprintf(stderr, "%s: GGML_NUMA_FAKE=%u but only %u allowed CPUs, keeping real topology\n",
+                    __func__, fake_nodes, n_allowed);
+        } else {
+            g_state.numa.fake    = true;
+            g_state.numa.n_nodes = fake_nodes;
+            for (uint32_t n = 0; n < fake_nodes; ++n) {
+                struct ggml_numa_node * node = &g_state.numa.nodes[n];
+                const uint32_t first = ( n      * n_allowed) / fake_nodes;
+                const uint32_t last  = ((n + 1) * n_allowed) / fake_nodes;
+                node->n_cpus = 0;
+                for (uint32_t i = first; i < last; ++i) {
+                    node->cpus[node->n_cpus++] = allowed[i];
+                }
+            }
+            GGML_PRINT("%s: FAKE NUMA topology: %u nodes over %u CPUs (testbed mode, no memory binding)\n",
+                       __func__, fake_nodes, n_allowed);
+        }
     }
 
     GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
@@ -4770,22 +4863,55 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
     GGML_PRINT_DEBUG("found our process on numa node %u, CPU %u\n", g_state.numa.current_node, current_cpu);
 
-    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
-        struct ggml_numa_node * node = &g_state.numa.nodes[n];
-        GGML_PRINT_DEBUG("CPUs on node %u:", n);
-        node->n_cpus = 0;
-        for (uint32_t c = 0; c < g_state.numa.total_cpus; ++c) {
-            rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", n, c);
-            GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-            if (stat(path, &st) == 0) {
-                node->cpus[node->n_cpus++] = c;
-                GGML_PRINT_DEBUG(" %u", c);
+    if (g_state.numa.fake) {
+        // getcpu() reported the real (single) node; remap via the fake CPU->node table
+        g_state.numa.current_node = 0;
+        for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+            for (uint32_t i = 0; i < g_state.numa.nodes[n].n_cpus; ++i) {
+                if (g_state.numa.nodes[n].cpus[i] == current_cpu) {
+                    g_state.numa.current_node = n;
+                    n = g_state.numa.n_nodes; // break both loops
+                    break;
+                }
             }
         }
-        GGML_PRINT_DEBUG("\n");
+    } else {
+        for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+            struct ggml_numa_node * node = &g_state.numa.nodes[n];
+            GGML_PRINT_DEBUG("CPUs on node %u:", n);
+            node->n_cpus = 0;
+            for (uint32_t c = 0; c < g_state.numa.total_cpus; ++c) {
+                rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", n, c);
+                GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+                if (stat(path, &st) == 0) {
+                    node->cpus[node->n_cpus++] = c;
+                    GGML_PRINT_DEBUG(" %u", c);
+                }
+            }
+            GGML_PRINT_DEBUG("\n");
+        }
     }
 
-    if (ggml_is_numa()) {
+    // testbed knobs, parsed here so they ride along with any --numa strategy:
+    // GGML_NUMA_STATS=1 dumps mirror-path counters at exit (=2: also per llama_print_timings);
+    // GGML_NUMA_XGMI_GBPS caps explicit cross-node copies to model the socket interconnect.
+    {
+        const char * s = getenv("GGML_NUMA_STATS");
+        if (s && *s && strcmp(s, "0") != 0) {
+            g_numa_stats_level = strcmp(s, "2") == 0 ? 2 : 1;
+            atexit(ggml_numa_stats_print);
+        }
+        s = getenv("GGML_NUMA_XGMI_GBPS");
+        if (s && *s) {
+            double v = atof(s);
+            if (v > 0.0) {
+                g_state.numa.throttle_gbps = v;
+                GGML_PRINT("%s: cross-node copy bandwidth capped at %.1f GB/s (GGML_NUMA_XGMI_GBPS)\n", __func__, v);
+            }
+        }
+    }
+
+    if (!g_state.numa.fake && ggml_is_numa()) {
         FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
         if (fptr != NULL) {
             char buf[42];
@@ -4824,6 +4950,13 @@ static inline void * ggml_numa_tensor_data(const struct ggml_tensor * t, int nod
     for (const struct ggml_tensor * a = t; a; a = a->view_src) {
         if (a->data_numa) {
             void * base = ((const struct ggml_numa_mirror *) a->data_numa)->data[node];
+#if defined(__gnu_linux__)
+            if (g_numa_stats_level) {
+                atomic_fetch_add_explicit(base ? &g_numa_stats.node[node].resolve_hit
+                                               : &g_numa_stats.node[node].resolve_fallback,
+                                          1ULL, memory_order_relaxed);
+            }
+#endif
             // offset from the already-resolved pointers (t->data == a->data + accumulated view offs)
             return base ? (char *) base + ((const char *) t->data - (const char *) a->data) : t->data;
         }
@@ -4885,6 +5018,84 @@ int ggml_numa_node_for_thread(int ith, int nth) {
     return node;
 }
 
+int ggml_numa_stats_level(void) {
+    return g_numa_stats_level;
+}
+
+void ggml_numa_stats_print(void) {
+#if defined(__gnu_linux__)
+    if (g_state.numa.n_nodes < 1) {
+        return;
+    }
+    const uint32_t n = g_state.numa.n_nodes;
+    fprintf(stderr, "numa_stats: nodes=%u fake=%d strategy=%u throttle_gbps=%.1f\n",
+            n, g_state.numa.fake ? 1 : 0, g_state.numa.numa_strategy, g_state.numa.throttle_gbps);
+    for (uint32_t k = 0; k < n && k < GGML_NUMA_MAX_NODES; ++k) {
+        fprintf(stderr, "numa_stats: node%u resolve_hit=%llu resolve_fallback=%llu\n", k,
+                (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].resolve_hit,      memory_order_relaxed),
+                (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].resolve_fallback, memory_order_relaxed));
+    }
+    fprintf(stderr, "numa_stats: populate_bytes=%llu populate_calls=%llu resync_bytes=%llu resync_calls=%llu\n",
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.populate_bytes, memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.populate_calls, memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.resync_bytes,   memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.resync_calls,   memory_order_relaxed));
+    fprintf(stderr, "numa_stats: kv_repl_bytes=%llu kv_repl_calls=%llu barriers_hier=%llu barriers_flat=%llu throttle_sleep_us=%llu\n",
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.kv_repl_bytes,     memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.kv_repl_calls,     memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.barriers_hier,     memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.barriers_flat,     memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.throttle_sleep_us, memory_order_relaxed));
+    if (g_numa_stats_level >= 2) {
+        // per-phase mode: caller dumps after each llama_print_timings, so restart the window
+        for (uint32_t k = 0; k < GGML_NUMA_MAX_NODES; ++k) {
+            atomic_store_explicit(&g_numa_stats.node[k].resolve_hit,      0ULL, memory_order_relaxed);
+            atomic_store_explicit(&g_numa_stats.node[k].resolve_fallback, 0ULL, memory_order_relaxed);
+        }
+        atomic_store_explicit(&g_numa_stats.populate_bytes,    0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.populate_calls,    0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.resync_bytes,      0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.resync_calls,      0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.kv_repl_bytes,     0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.kv_repl_calls,     0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.barriers_hier,     0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.barriers_flat,     0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.throttle_sleep_us, 0ULL, memory_order_relaxed);
+    }
+#endif
+}
+
+#if defined(__gnu_linux__)
+// pace an explicit cross-node copy to g_state.numa.throttle_gbps: `bytes` were copied since
+// t_start_us; wait out the remainder of the modeled transfer time. Spin for sub-200us tails
+// (nanosleep granularity under WSL2 is far coarser), nanosleep for longer ones.
+static void ggml_numa_paced_wait(size_t bytes, double gbps, int64_t t_start_us) {
+    if (gbps <= 0.0 || bytes == 0) {
+        return;
+    }
+    const int64_t target_us = (int64_t) ((double) bytes / (gbps * 1e3)); // GB/s == bytes/us * 1e-3
+    const int64_t deadline  = t_start_us + target_us;
+    int64_t now = ggml_time_us();
+    if (now >= deadline) {
+        return;
+    }
+    const int64_t waited = deadline - now;
+    while (now < deadline) {
+        const int64_t left = deadline - now;
+        if (left > 200) {
+            struct timespec ts = { .tv_sec = left / 1000000, .tv_nsec = (left % 1000000) * 1000 };
+            nanosleep(&ts, NULL);
+        } else {
+            ggml_numa_spin_pause();
+        }
+        now = ggml_time_us();
+    }
+    if (g_numa_stats_level) {
+        GGML_NUMA_STAT_ADD(throttle_sleep_us, waited);
+    }
+}
+#endif
+
 #if defined(__gnu_linux__)
 #ifndef MPOL_BIND
 #define MPOL_BIND 2
@@ -4896,6 +5107,9 @@ int ggml_numa_node_for_thread(int ith, int nth) {
 static long ggml_sys_mbind(void * addr, unsigned long len, int mode,
                            const unsigned long * nodemask, unsigned long maxnode, unsigned flags) {
 #if defined(SYS_mbind)
+    if (g_state.numa.fake) {
+        return 0; // fake topology: all memory really is one node; binding would fail or mislead
+    }
     return syscall(SYS_mbind, addr, len, mode, nodemask, maxnode, flags);
 #else
     UNUSED(addr); UNUSED(len); UNUSED(mode); UNUSED(nodemask); UNUSED(maxnode); UNUSED(flags);
@@ -4977,7 +5191,26 @@ struct ggml_numa_copy_slice {
     char *       dst;
     size_t       size;
     int          node;
+    double       gbps; // this worker's share of GGML_NUMA_XGMI_GBPS (0 = unthrottled)
 };
+
+// copy with the effective bandwidth capped at gbps: 8 MiB bursts, pacing after each so the
+// modeled interconnect stalls are spread over the transfer instead of tacked onto the end
+static void ggml_numa_throttled_memcpy(char * dst, const char * src, size_t size, double gbps) {
+    if (gbps <= 0.0) {
+        memcpy(dst, src, size);
+        return;
+    }
+    const size_t  burst = 8u << 20;
+    const int64_t t0    = ggml_time_us();
+    size_t done = 0;
+    while (done < size) {
+        const size_t n = size - done < burst ? size - done : burst;
+        memcpy(dst + done, src + done, n);
+        done += n;
+        ggml_numa_paced_wait(done, gbps, t0);
+    }
+}
 
 static void * ggml_numa_copy_worker(void * arg) {
     struct ggml_numa_copy_slice * s = (struct ggml_numa_copy_slice *) arg;
@@ -4994,7 +5227,7 @@ static void * ggml_numa_copy_worker(void * arg) {
             CPU_FREE(cpus);
         }
     }
-    memcpy(s->dst, s->src, s->size);
+    ggml_numa_throttled_memcpy(s->dst, s->src, s->size, s->gbps);
     return NULL;
 }
 #endif
@@ -5004,17 +5237,25 @@ static void * ggml_numa_copy_worker(void * arg) {
 
 void ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int node) {
 #if defined(__gnu_linux__)
+    if (g_numa_stats_level) {
+        GGML_NUMA_STAT_ADD(populate_bytes, size);
+        GGML_NUMA_STAT_ADD(populate_calls, 1);
+    }
+    const double gbps = g_state.numa.throttle_gbps;
     int nthr = GGML_NUMA_COPY_MAX_THREADS;
     if (node >= 0 && node < (int) g_state.numa.n_nodes && (int) g_state.numa.nodes[node].n_cpus < nthr) {
         nthr = (int) g_state.numa.nodes[node].n_cpus;
     }
     if (size < GGML_NUMA_COPY_MIN_PARALLEL || nthr <= 1 || g_state.numa.n_nodes < 2) {
-        memcpy(dst, src, size);
+        ggml_numa_throttled_memcpy((char *) dst, (const char *) src, size, gbps);
         return;
     }
     pthread_t threads[GGML_NUMA_COPY_MAX_THREADS];
     struct ggml_numa_copy_slice slices[GGML_NUMA_COPY_MAX_THREADS];
     const size_t chunk = (size + nthr - 1) / nthr;
+    // workers share the modeled interconnect: each gets an equal slice of the cap
+    const int    n_active    = (int) ((size + chunk - 1) / chunk);
+    const double gbps_share  = gbps > 0.0 && n_active > 0 ? gbps / n_active : 0.0;
     int started = 0;
     for (int i = 0; i < nthr; ++i) {
         const size_t off = (size_t) i * chunk;
@@ -5023,6 +5264,7 @@ void ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int nod
         slices[i].dst  = (char *) dst + off;
         slices[i].size = off + chunk <= size ? chunk : size - off;
         slices[i].node = node;
+        slices[i].gbps = gbps_share;
         if (pthread_create(&threads[i], NULL, ggml_numa_copy_worker, &slices[i]) != 0) {
             // couldn't spawn more workers: do this slice (and the rest) inline
             for (int j = i; j < nthr; ++j) {
@@ -5121,8 +5363,18 @@ void ggml_numa_tensor_resync(struct ggml_tensor * tensor) {
     for (int n = 1; n < nodes; ++n) { // node 0 aliases tensor->data
         if (m->data[n] && m->data[n] != tensor->data) {
             ggml_numa_memcpy_to_node(m->data[n], tensor->data, nbytes, n);
+#if defined(__gnu_linux__)
+            if (g_numa_stats_level) {
+                GGML_NUMA_STAT_ADD(resync_bytes, nbytes);
+            }
+#endif
         }
     }
+#if defined(__gnu_linux__)
+    if (g_numa_stats_level && nodes > 1) {
+        GGML_NUMA_STAT_ADD(resync_calls, 1);
+    }
+#endif
 }
 
 // NUMA mirror (KV cache): after a cpy/dup has written node 0's copy of a mirrored KV tensor view,
@@ -5152,6 +5404,10 @@ static void ggml_numa_replicate_kv_write(const struct ggml_compute_params * para
     const int64_t n1    = dst->ne[1], n2 = dst->ne[2], n3 = dst->ne[3];
     const int64_t nrows = n1*n2*n3;
     const char *  base0 = (const char *) m->data[0]; // node 0 aliases the root tensor's data
+#if defined(__gnu_linux__)
+    const int64_t t0 = ggml_time_us();
+#endif
+    size_t local_bytes = 0;
     for (int64_t r = ith; r < nrows; r += nth) {
         const int64_t i1 = r % n1;
         const int64_t i2 = (r / n1) % n2;
@@ -5161,7 +5417,25 @@ static void ggml_numa_replicate_kv_write(const struct ggml_compute_params * para
         for (int n = 1; n < nodes; ++n) {
             memcpy((char *) m->data[n] + off, row0, run);
         }
+        local_bytes += run * (nodes - 1);
     }
+#if defined(__gnu_linux__)
+    // model the interconnect: this fan-out is exactly the traffic that crosses sockets per
+    // token, so pace each thread to its share of the modeled bandwidth before the next op
+    if (g_state.numa.throttle_gbps > 0.0 && nth > 0) {
+        ggml_numa_paced_wait(local_bytes, g_state.numa.throttle_gbps / nth, t0);
+    }
+    if (g_numa_stats_level) {
+        if (local_bytes > 0) {
+            GGML_NUMA_STAT_ADD(kv_repl_bytes, local_bytes);
+        }
+        if (ith == 0) {
+            GGML_NUMA_STAT_ADD(kv_repl_calls, 1);
+        }
+    }
+#else
+    UNUSED(local_bytes);
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////

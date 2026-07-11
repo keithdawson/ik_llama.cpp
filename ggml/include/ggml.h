@@ -955,6 +955,10 @@ extern "C" {
     GGML_API void     ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor);
     // re-sync node copies after a write that bypassed graph-CPY replication (state restore, K-shift, clear)
     GGML_API void     ggml_numa_tensor_resync(struct ggml_tensor * tensor);
+    // GGML_NUMA_STATS diagnostics: 0=off, 1=dump counters at exit, 2=also dump+reset per llama_print_timings
+    GGML_API int      ggml_numa_stats_level(void);
+    // print "numa_stats: key=value" lines to stderr (resets the counters when level >= 2)
+    GGML_API void     ggml_numa_stats_print(void);
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);
