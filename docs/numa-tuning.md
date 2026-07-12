@@ -63,6 +63,55 @@ environment: { OMP_WAIT_POLICY: PASSIVE, GOMP_SPINCOUNT: "<best>" }
 Re-tune if the thread count, model, or GPU/CPU split changes materially — the optimum
 tracks how long the per-layer GPU segments are relative to thread wake latency.
 
+## Pandora validation suite (`scripts/pandora-tune.sh`)
+
+Every knob that the fake-NUMA testbed shipped needs one confirmation sweep on the real
+machine. `pandora-tune.sh` runs them and prints, per knob, the winning value and where
+to put it. General form:
+
+```sh
+# CPU-only serving shape:
+./scripts/pandora-tune.sh <sub> -m /models/GLM-5.2-Q5_K_XL.gguf -t 188 -r 2
+
+# hybrid shape (dense on the Blackwells, experts on CPU): append your real flags
+./scripts/pandora-tune.sh <sub> -m ... -g 0 -- -ngl 99 -ot exps=CPU -fa on
+```
+
+Recommended order and where each answer goes:
+
+| # | Subcommand | Sweeps | Answer goes to |
+|---|---|---|---|
+| 1 | `census` | (one instrumented run) | gate for everything else: **"duplicated N weight tensors" must appear**, fallbacks 0, expert skew report |
+| 2 | `threads` | `-t` 96–192 | `-t` on the serving command line |
+| 3 | `barrier-gate` | `GGML_NUMA_HIER_BATCH_MAX` -1…512 | env, only if ≠ 32 |
+| 4 | `pin` | `GGML_NUMA_PIN` node/cpu | env, only if cpu wins |
+| 5 | `copy` | `GGML_NUMA_COPY_THREADS` × `GGML_NUMA_NT_COPY` | env; affects load + resync only |
+| 6 | `spincount` (hybrid) | `GOMP_SPINCOUNT` 0–250k | env, only if ≠ 25000 (see Waiting policy above) |
+| 7 | `reserve` (hybrid) | `GGML_NUMA_RESERVE_CPUS` 0–4@gpu-node | env, only if ≠ 0 |
+| 8 | `bind-compute` (hybrid) | `--numa-bind-compute` | CLI flag, only if on wins |
+| 9 | `hugetlb` (optional) | `GGML_NUMA_HUGETLB` | env; only bother on a long-uptime box (testbed: tg -6.5%) |
+| 10 | `verify` | (final config) | record pp/tg as the tuned reference |
+
+`all` runs 1–5 (plus 7–8 when hybrid flags are passed). Lists are overridable via env
+(`GATE_LIST`, `COPY_THREADS_LIST`, `NT_LIST`, `THREADS_LIST`, `RESERVE_LIST`).
+
+### Sizing notes for a ~500 GB model (GLM 5.2 Q5_K_XL, 700B/A40B)
+
+- **Mirror fits**: 2 × 500 GB ≈ 1 TB of the 2.3 TB. The free-RAM check needs
+  `MemAvailable > weights + 2 GB` *after* the weights are loaded — with ~1.8 TB free
+  that's comfortable, but anything else big running (vLLM) counts against it. The
+  census run confirms mirroring actually happened.
+- **Run cost**: the first load pulls 500 GB from disk (minutes); afterwards the file is
+  page-cached (fits in leftover RAM), so each rep ≈ cached load + mirror populate
+  (500 GB at the `copy`-tuned rate; ~25 s at 20 GB/s) + the benchmark itself. Budget
+  roughly 5–10 min per rep; the full suite at `-r 2` is an overnight job — run
+  subcommands selectively.
+- **Census first**: verify GLM's expert routing skew (`max_over_mean`); gemma-4 and
+  Qwen1.5-MoE both measured near-uniform (≤ 1.5·mean per expert), which validates
+  mirroring over expert-sharding. If GLM measures similarly, mirror is settled.
+- Do **not** wrap runs in `numactl --cpunodebind` (mirror re-pins and escapes it), and
+  never set `--cpuset-mems`/`AllowedMemoryNodes` — mirrors must allocate on every node.
+
 ## 1. Verifying placement: `numastat` and `numa_maps`
 
 ### System-wide allocation counters
