@@ -70,6 +70,36 @@ GPU compute is significantly faster than CPU compute, even with NUMA mirroring. 
 - You can achieve this by dropping `--cpu-moe` and using `--n-cpu-moe N` (where `N` is the number of MoE layers to leave on the CPU, pushing the rest to the GPU).
 - Alternatively, simply omit `--cpu-moe` entirely and use `-ngl X` where `X` is a specific number of total layers that fills your GPU VRAM to capacity without overflowing.
 
+## Tuning knobs, diagnostics & validation tooling
+
+Beyond the flags above, the fork ships runtime-tunable knobs (all env vars, all inert at
+their defaults) plus the tooling to pick their values for a specific machine:
+
+| Env var | Default | What it does |
+|---|---|---|
+| `GGML_NUMA_PIN` | node | `cpu` pins each mirror thread to one specific CPU (stops cross-CCD L3 migration) |
+| `GGML_NUMA_HIER_BATCH_MAX` | 32 | batches above this use the flat barrier instead of the NUMA-hierarchical one; negative = always hierarchical |
+| `GGML_NUMA_RESERVE_CPUS` | unset | `N[@node]` excludes N CPUs of a node from compute pinning so unpinned threads (CUDA driver, scheduler) get dedicated cores; the thread split rebalances by CPU count automatically |
+| `GGML_NUMA_COPY_THREADS` | 16 | threads for the dest-pinned parallel mirror-populate copy |
+| `GGML_NUMA_COPY_MIN_MB` | 64 | below this size a single memcpy is used |
+| `GGML_NUMA_NT_COPY` | off | `1` = non-temporal (streaming) stores for the explicit cross-node copies |
+| `GGML_NUMA_HUGETLB` | off | `1` = back mirror allocations with explicit 2 MiB hugetlb pages (needs `vm.nr_hugepages`; falls back to THP) |
+| `GGML_NUMA_STATS` | off | `1` = dump mirror-path counters at exit (incl. a per-expert MoE routing census); `2` = also per `llama_print_timings` |
+| `GGML_NUMA_FAKE` | unset | testbed only: fabricate N NUMA nodes on a 1-node box (see `docs/numa-testbed.md`) |
+| `GGML_NUMA_XGMI_GBPS` | unset | testbed only: cap explicit cross-node copies to model the socket interconnect |
+
+**Automatic waiting policy:** with `--numa mirror` + GPU offload, the tools default
+`OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=25000` (pinned workers spin ~100 µs then
+sleep, so the CUDA driver thread is never starved — measured +16% tg over no-numa on
+the testbed). Setting either variable yourself disables the auto-default.
+
+**Pick values for your machine** with `scripts/pandora-tune.sh` — one subcommand per
+knob, each prints the winning value and where to apply it (`census` first: it verifies
+mirroring actually engaged and reports MoE expert-routing skew). `scripts/tune-spincount.sh`
+sweeps the waiting-policy spin count. Full run order, per-knob guidance, and sizing notes
+for ~500 GB models: [`docs/numa-tuning.md`](docs/numa-tuning.md). Local development uses
+the fake-NUMA Docker testbed with measured experiment verdicts:
+[`docs/numa-testbed.md`](docs/numa-testbed.md).
 
 # NUMA mode benchmarks
 
