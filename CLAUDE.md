@@ -55,6 +55,11 @@ bandwidth on both sockets. Built for a 2× EPYC 9665 (2 nodes, 12 DDR5 channels 
 ## Server quickstart (airgapped)
 
 ```sh
+# 0. first session only: restore exec bits (zip drops them) and clear any build
+#    directory that rode along in the package (Windows .exe artifacts are useless here)
+chmod +x scripts/*.sh
+rm -rf build
+
 # 1. build (CPU; add -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="89;120" for the Ada/Blackwells)
 ./scripts/build-zen.sh
 
@@ -88,6 +93,11 @@ bandwidth on both sockets. Built for a 2× EPYC 9665 (2 nodes, 12 DDR5 channels 
 - Testbed only: WSL2 SMT siblings are adjacent pairs, so 8 physical cores =
   `--cpuset-cpus 0,2,4,6,8,10,12,14`; Git Bash needs `MSYS_NO_PATHCONV=1` for docker
   path args; keep `*.sh` LF (enforced via .gitattributes).
+- **Packaging for the sneakernet**: build the carry archive with
+  `git archive --format=tar.gz -o pandora-numa-kit-$(git rev-parse --short HEAD).tar.gz HEAD`
+  — a plain folder copy drags along git-ignored junk (notably `build/` full of Windows
+  `.exe` files, which cost a confused session on the server). Binaries are never
+  carried; the server builds from source (quickstart step 1).
 
 ## Branch layout
 
