@@ -43,8 +43,9 @@ First run reads 500 GB from disk — expect several minutes of apparent hang. Th
       (missing = mirror silently skipped: MemAvailable < weights + 2 GB. Free memory
       — vLLM, hugetlb pools — and rerun.)
 - [ ] `resolve_fallback=0` on both nodes
-- [ ] moe census `max_over_mean` = ________  (< ~1.5 means routing is uniform →
-      mirroring is the right architecture for GLM, same as gemma/qwen measured)
+- [ ] moe census `max_over_mean` = ________  (informational only — no bearing on mirror
+      correctness. ~1.0 = perfectly uniform routing, up to ~2.5 typical; it gauges the
+      hypothetical expert-sharding alternative, nothing else. GLM measured 1.74 = fine.)
 
 ## 4. Sweeps (in this order; each prints "==> RESULT" with the value + where it goes)
 
@@ -101,6 +102,11 @@ numastat -p $(pgrep llama-server)     # both nodes should each hold ~= the model
 ```
 
 ## If something looks wrong
+
+- A pp or tg column reads 0: the timing-line parse missed. The raw lines are saved in
+  `pandora-tune-results/last-timings.log` (or `tune-spincount-timings.log`) — eyeball
+  the `eval time` line there; the throughput number sits right before "tokens per
+  second" and the parser expects exactly that phrase.
 
 - Garbage/weird text ≠ backend bug until proven: instruct models degenerate on raw
   prompts — retest with the model's chat template before debugging.

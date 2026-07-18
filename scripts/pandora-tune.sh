@@ -58,6 +58,7 @@ EXTRA=("$@")
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 RESULTS=${RESULTS:-pandora-tune-results}
 mkdir -p "$RESULTS"
+: > "$RESULTS/last-timings.log"   # raw llama_print_timings lines from this invocation
 
 # ~3k-token prompt so pp is measured for real
 PROMPT=$(mktemp)
@@ -70,15 +71,26 @@ is_hybrid=0
 case " ${EXTRA[*]:-} " in *" -ngl "*) is_hybrid=1 ;; esac
 
 # run_bench "ENV1=v ENV2=v" [extra args...]  -> echoes "pp tg" (averaged over REPS)
+# Parsing is position-independent (the value right before "tokens per second") because
+# some models append extra fields to the eval line (e.g. GLM MTP/draft stats), which
+# broke a fixed-field parse. Raw timing lines are appended to $RESULTS/last-timings.log
+# so a zero can always be diagnosed offline: cat that file and eyeball the eval line.
 run_bench() {
     local envs=$1; shift
     local pp_sum=0 tg_sum=0 pp tg r
     for r in $(seq 1 "$REPS"); do
         read -r pp tg < <(env $envs "$BIN" -m "$MODEL" -t "$THREADS" "${EXTRA[@]}" "$@" \
                 -c 4096 -n "$NPRED" --temp 0 --seed 1 --no-display-prompt -f "$PROMPT" 2>&1 |
-            awk '/llama_print_timings: prompt eval time/ { pp=$(NF-3) }
-                 /llama_print_timings: *eval time/       { tg=$(NF-3) }
-                 END { print pp+0, tg+0 }')
+            awk -v raw="$RESULTS/last-timings.log" '
+                /llama_print_timings/ {
+                    print >> raw
+                    if (/prompt eval time/) {
+                        for (i = 2; i <= NF; i++) if ($i == "tokens" && $(i+1) == "per") pp = $(i-1)
+                    } else if (/ eval time/) {
+                        for (i = 2; i <= NF; i++) if ($i == "tokens" && $(i+1) == "per") tg = $(i-1)
+                    }
+                }
+                END { print pp+0, tg+0 }')
         pp_sum=$(awk "BEGIN{print $pp_sum+$pp}"); tg_sum=$(awk "BEGIN{print $tg_sum+$tg}")
     done
     awk "BEGIN{printf \"%.1f %.2f\", $pp_sum/$REPS, $tg_sum/$REPS}"
@@ -115,8 +127,10 @@ sub_census() {
     echo "    the mirror free-RAM check failed (MemAvailable < weights size + 2 GB) and you are"
     echo "    running UNMIRRORED - fix memory pressure before tuning anything else."
     echo "  - resolve_fallback must be 0 on every node."
-    echo "  - max_over_mean < ~1.5 on moe stats means expert routing is near-uniform (mirroring"
-    echo "    is the right architecture; sharding would only save RAM, not time)."
+    echo "  - moe max_over_mean is INFORMATIONAL ONLY: it has no bearing on mirror correctness"
+    echo "    (every node holds all experts). It gauges the hypothetical expert-sharding"
+    echo "    alternative: ~1.0 = perfectly uniform routing; values up to ~2.5 are typical and"
+    echo "    still shard-friendly; >>3 means a few hot experts dominate."
     echo "  - full per-expert histogram saved to $RESULTS/census-expert-rows.csv"
 }
 

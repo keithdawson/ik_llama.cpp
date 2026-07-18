@@ -51,12 +51,22 @@ for i in $(seq 1 160); do
 done
 
 run_once() { # $1 = spincount ; prints "pp tg"
+    # position-independent parse (value before "tokens per second"): some models append
+    # extra fields to the eval line (e.g. GLM MTP stats). Raw lines are kept in
+    # tune-spincount-timings.log for offline diagnosis if a column reads 0.
     OMP_WAIT_POLICY=PASSIVE GOMP_SPINCOUNT=$1 \
     "$BIN" -m "$MODEL" --numa mirror "${TARGS[@]}" "${EXTRA[@]}" \
         -c 4096 -n "$NPRED" --temp 0 --seed 1 --no-display-prompt -f "$PROMPT" 2>&1 |
-    awk '/llama_print_timings: prompt eval time/ { pp=$(NF-3) }
-         /llama_print_timings: *eval time/       { tg=$(NF-3) }
-         END { print pp+0, tg+0 }'
+    awk -v raw="tune-spincount-timings.log" '
+        /llama_print_timings/ {
+            print >> raw
+            if (/prompt eval time/) {
+                for (i = 2; i <= NF; i++) if ($i == "tokens" && $(i+1) == "per") pp = $(i-1)
+            } else if (/ eval time/) {
+                for (i = 2; i <= NF; i++) if ($i == "tokens" && $(i+1) == "per") tg = $(i-1)
+            }
+        }
+        END { print pp+0, tg+0 }'
 }
 
 echo "spincount sweep: $SPINS  (reps=$REPS, bin=$BIN)"
