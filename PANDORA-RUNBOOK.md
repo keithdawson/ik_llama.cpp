@@ -17,7 +17,11 @@ rm -rf build                   # Windows .exe junk from the carry package — de
 ```sh
 ./scripts/build-zen.sh                                   # ~5-10 min
 ./build/bin/llama-cli --version                          # must run
-objdump -d build/bin/llama-cli | grep -c vpdpbusd        # want a big number (AVX-512 VNNI in)
+# AVX-512 check: kernels live in the SHARED LIB, not the thin llama-cli binary —
+# objdump the lib, or just look for the load-time banner
+# "======================================= HAVE_FANCY_SIMD is defined"
+# and "AVX512_VNNI = 1" in the system_info line of any run's log.
+objdump -d "$(find build -name 'libggml*.so' | head -1)" | grep -c vpdpbusd   # want a big number
 ```
 
 If cmake/gcc are missing, install from the offline-kit RPM repo first.
