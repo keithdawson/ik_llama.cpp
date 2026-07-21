@@ -112,8 +112,16 @@ Measure, don't eyeball: per-generation the server logs
 `draft acceptance rate = 0.NNN (N accepted / N generated)` and the API timings include
 `draft_n_accepted`. Acceptance ~0.6+ on code is where the tg speedup lives.
 
-Also: the chain is driven by **llama-server** (not llama-cli), and use `n_max=1` for
-mtp — GLM's MTP head is one NextN layer deep.
+Also: the chain is driven by **llama-server ONLY** — verified in source: llama-cli
+parses `--spec-type` and then ignores it entirely (the speculative machinery is invoked
+solely from server-context.cpp). A llama-cli test showing "no TG change" proves
+nothing. Use `n_max=1` for mtp — GLM's MTP head is one NextN layer deep.
+
+Verified for unsloth/GLM-5.2-GGUF: the quants KEEP the MTP layer — the model card
+states unsloth improved GLM-5.2's MTP layer for speculative decoding (+20% acceptance
+length). There is no separate drafter file for GLM; the NextN tensors are embedded in
+the main GGUF shards, so a normal HF pull of the quant folder has everything. If the
+`0 NextN layers` warning still appears with this quant, that's a loader gap — report it.
 
 **No NextN tensors? ngram-mod works on ANY gguf** (drafts from the context's own
 n-grams, no model support needed) and is worth testing alone on coding workloads:
