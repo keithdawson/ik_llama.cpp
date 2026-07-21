@@ -154,6 +154,16 @@ Caveats / checks, in order:
    output tensor quant; leave default unless chasing quality issues.
 7. Open WebUI needs nothing special — speculation is server-internal and invisible to
    the API.
+8. **Concurrency**: any spec chain requires `-np 1`; starting with `-np > 1` FAILS
+   LOUDLY at boot ("Speculative decoding is currently limited to a single server
+   slot") — never a silent disable. With `-np 1`, simultaneous users queue (full spec
+   speed each, serialized). Multi-user alternative: drop the spec flags and run
+   `-np 2+` (concurrent batched decode, higher aggregate, lower per-stream; each slot
+   gets n_ctx/n_parallel context — size -c accordingly). Can't have both today.
+9. Why chain both stages: ngram-mod = free context-lookup drafts, long bursts on
+   repetitive text (code!), nothing on novel text; MTP = trained 1-token draft head,
+   fires steadily every step. Chain = ngram opportunist first, MTP steady fallback.
+   Both are lossless (target verifies every draft; output bit-identical).
 
 ## Boot-log readings (observed on the server, both explained)
 
