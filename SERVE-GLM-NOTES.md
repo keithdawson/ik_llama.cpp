@@ -96,6 +96,32 @@ variant for coding chats — n-gram self-speculation first, MTP fallback:
 --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0
 ```
 
+**"No TG change" diagnosis — check the boot log first.** If the GGUF lacks the NextN
+tensors the server prints a WARNING and silently runs unspeculated:
+
+```
+MTP speculative stage requested, but model has 0 NextN layers. Removing MTP from the configured stage chain.
+```
+
+The two definitive boot-log states:
+- ACTIVE  -> `MTP needs embeddings on decode, enabling` (and no NextN warning)
+- REMOVED -> the `0 NextN layers` warning -> this quant stripped the MTP tensors; no
+  flag fixes that, you need a GGUF that kept them.
+
+Measure, don't eyeball: per-generation the server logs
+`draft acceptance rate = 0.NNN (N accepted / N generated)` and the API timings include
+`draft_n_accepted`. Acceptance ~0.6+ on code is where the tg speedup lives.
+
+Also: the chain is driven by **llama-server** (not llama-cli), and use `n_max=1` for
+mtp — GLM's MTP head is one NextN layer deep.
+
+**No NextN tensors? ngram-mod works on ANY gguf** (drafts from the context's own
+n-grams, no model support needed) and is worth testing alone on coding workloads:
+
+```sh
+--spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8
+```
+
 Caveats / checks, in order:
 
 1. **Prerequisite**: the GGUF must contain the MTP/nextn tensors (unsloth quants
