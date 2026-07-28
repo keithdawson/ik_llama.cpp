@@ -31,21 +31,22 @@ When `--numa mirror` runs with GPU layers, the pinned OpenMP workers must spin o
 *briefly* and then sleep while the GPU works: spinning through GPU segments starves the
 CUDA driver thread (measured -12% pp / -5% tg on the testbed), while fully passive
 waiting makes every CPU expert segment pay thread-wake latency (~-10% pp). The binary
-therefore **auto-sets `OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=25000`** whenever
+therefore **auto-sets `OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=5000`** whenever
 mirror + `-ngl > 0` and *neither* variable is already in the environment (it logs one
-line when it does). 25000 (~100 µs of spinning) was tuned on a desktop Zen 5 — tune it
-once for this machine:
+line when it does). 5000 is the measured optimum on the dual-EPYC target; a desktop
+Zen 5 preferred 25000 (more cores → shorter spin wins, since idle spinners cost more
+when there are ~190 of them). Re-tune per machine:
 
 ```sh
 ./scripts/tune-spincount.sh -m /path/model.gguf -t <your -t> -- <your real serving flags>
 ```
 
-The script sweeps `GOMP_SPINCOUNT` over {0, 5k, 10k, 25k, 50k, 100k, 250k} against a
-~3k-token prompt and prints a pp/tg table plus the best value.
+The script sweeps `GOMP_SPINCOUNT` over {0, 1k, 2.5k, 5k, 7.5k, 10k, 25k, 100k} against
+a ~3k-token prompt and prints a pp/tg table plus the best value (override with `SPINS=`).
 
 **What to do with the answer:** pick the spin count with the best tg whose pp is also
 within noise of the best pp row (they usually agree; if not, favor tg for a serving
-box). If it's 25000, do nothing — the built-in default already matches. If it differs,
+box). If it's 5000, do nothing — the built-in default already matches. If it differs,
 set both variables explicitly in the serving environment — an explicit setting disables
 the auto-default:
 
@@ -86,7 +87,7 @@ Recommended order and where each answer goes:
 | 3 | `barrier-gate` | `GGML_NUMA_HIER_BATCH_MAX` -1…512 | env, only if ≠ 32 |
 | 4 | `pin` | `GGML_NUMA_PIN` node/cpu | env, only if cpu wins |
 | 5 | `copy` | `GGML_NUMA_COPY_THREADS` × `GGML_NUMA_NT_COPY` | env; affects load + resync only |
-| 6 | `spincount` (hybrid) | `GOMP_SPINCOUNT` 0–250k | env, only if ≠ 25000 (see Waiting policy above) |
+| 6 | `spincount` (hybrid) | `GOMP_SPINCOUNT` 0–100k | env, only if ≠ 5000 (see Waiting policy above) |
 | 7 | `reserve` (hybrid) | `GGML_NUMA_RESERVE_CPUS` 0–4@gpu-node | env, only if ≠ 0 |
 | 8 | `bind-compute` (hybrid) | `--numa-bind-compute` | CLI flag, only if on wins |
 | 9 | `hugetlb` (optional) | `GGML_NUMA_HUGETLB` | env; only bother on a long-uptime box (testbed: tg -6.5%) |

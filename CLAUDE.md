@@ -36,7 +36,7 @@ bandwidth on both sockets. Built for a 2× EPYC 9665 (2 nodes, 12 DDR5 channels 
 ## Validated defaults (already in the code — no action needed)
 
 - **Waiting policy auto-set**: mirror + `-ngl>0` defaults `OMP_WAIT_POLICY=PASSIVE` +
-  `GOMP_SPINCOUNT=25000` unless either is set by the user (+16% tg, pp-neutral on the
+  `GOMP_SPINCOUNT=5000` unless either is set by the user (+16% tg, pp-neutral on the
   testbed). Tune the exact spin count per machine with `tune-spincount.sh`.
 - **Hierarchical barrier gate** at `n_batch > 32` (`GGML_NUMA_HIER_BATCH_MAX` to sweep).
 - **CPU-count-weighted thread split**: nodes with fewer pinnable CPUs (e.g. after

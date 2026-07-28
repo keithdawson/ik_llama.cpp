@@ -90,7 +90,7 @@ their defaults) plus the tooling to pick their values for a specific machine:
 | `GGML_NUMA_XGMI_GBPS` | unset | testbed only: cap explicit cross-node copies to model the socket interconnect |
 
 **Automatic waiting policy:** with `--numa mirror` + GPU offload, the tools default
-`OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=25000` (pinned workers spin ~100 µs then
+`OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=5000` (pinned workers spin ~100 µs then
 sleep, so the CUDA driver thread is never starved — measured +16% tg over no-numa on
 the testbed). Setting either variable yourself disables the auto-default.
 

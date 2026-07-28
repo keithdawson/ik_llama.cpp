@@ -78,7 +78,7 @@ Reminder: this fork's `-fa` takes a value → `-fa on`.
 
 | # | Command | Record | Apply where |
 |---|---------|--------|-------------|
-| 5a | `./scripts/pandora-tune.sh spincount -m <model> -b build-cuda/bin/llama-cli -t <best> -g <N> -- -ngl 99 -ot exps=CPU -fa on` | `GOMP_SPINCOUNT` = ________ | env, only if ≠ 25000 (auto-default; pair with `OMP_WAIT_POLICY=PASSIVE`) |
+| 5a | `./scripts/pandora-tune.sh spincount -m <model> -b build-cuda/bin/llama-cli -t <best> -g <N> -- -ngl 99 -ot exps=CPU -fa on` | `GOMP_SPINCOUNT` = ________ | env, only if ≠ 5000 (auto-default; pair with `OMP_WAIT_POLICY=PASSIVE`) |
 | 5b | `./scripts/pandora-tune.sh reserve   ... same flags ...` | `GGML_NUMA_RESERVE_CPUS` = ______@____ | env, only if ≠ 0 |
 | 5c | `./scripts/pandora-tune.sh bind-compute ... same flags ...` | on / off = ________ | `--numa-bind-compute` CLI flag, only if `on` won |
 
@@ -115,6 +115,6 @@ numastat -p $(pgrep llama-server)     # both nodes should each hold ~= the model
 - Garbage/weird text ≠ backend bug until proven: instruct models degenerate on raw
   prompts — retest with the model's chat template before debugging.
 - Sweeps too slow? Narrow lists via env: `GATE_LIST="32 128"`, `THREADS_LIST="160 176 192"`,
-  `COPY_THREADS_LIST="16 32"`, `RESERVE_LIST="0 2"`, `SPINS="0 25000 100000"`.
+  `COPY_THREADS_LIST="16 32"`, `RESERVE_LIST="0 2"`, `SPINS="0 5000 25000"`.
 - Any run without `duplicated N weight tensors` in its log ran UNMIRRORED — its numbers
   are garbage; fix memory pressure and redo.

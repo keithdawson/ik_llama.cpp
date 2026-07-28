@@ -123,7 +123,7 @@ only expert tensors get mirrored — both verified. Config: `configs/gpu-hybrid.
 fork** — CPU-only builds are fine; needs upstream gemma-4 fixes cherry-picked).
 
 **Hybrid rule (auto-set by `llama_init_from_gpt_params` when mirror + `-ngl` > 0):
-`OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=25000`.** Setting either env var yourself
+`OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=5000`.** Setting either env var yourself
 disables the auto-default. The history, measured on gemma (testbed, 8 cores):
 
 | waiting policy (mirror hybrid) | pp vs no-numa | tg vs no-numa |
@@ -132,6 +132,10 @@ disables the auto-default. The history, measured on gemma (testbed, 8 cores):
 | fully PASSIVE (0 spins) | -7…-10% | +4…+8% (every CPU segment pays thread-wake latency) |
 | **PASSIVE + spin 25k (~100 µs)** | **+0.2%** | **+15.9%** (27.9 t/s) |
 | spin 250k | -1.4% | -4% (back toward starvation) |
+
+Note: 25k was the 8-core testbed optimum. On the real 190-thread dual-EPYC the measured
+optimum is **5000** (idle spinners cost more the more of them there are), which is now
+the built-in default; the testbed rows above are kept as the mechanism evidence.
 
 Controls that pin down the mechanism: PASSIVE *without* mirror collapses TG -36%
 (unpinned sleeping threads wake on random cores) — the win is specifically

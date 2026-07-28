@@ -3,7 +3,7 @@
 #
 # Background (docs/numa-tuning.md "Waiting policy"): with --numa mirror and GPU offload,
 # pinned OpenMP workers must briefly spin then sleep while the GPU runs. The built-in
-# default (OMP_WAIT_POLICY=PASSIVE, GOMP_SPINCOUNT=25000) was tuned on a desktop Zen 5;
+# default (OMP_WAIT_POLICY=PASSIVE, GOMP_SPINCOUNT=5000) was tuned on a desktop Zen 5;
 # this script finds the best value for the machine it runs on and prints what to set.
 #
 # Usage (run on the target machine, e.g. Pandora):
@@ -19,7 +19,7 @@ MODEL=""
 THREADS=""
 REPS=3
 NPRED=64
-SPINS=${SPINS:-"0 5000 10000 25000 50000 100000 250000"}
+SPINS=${SPINS:-"0 1000 2500 5000 7500 10000 25000 100000"}
 
 while getopts "b:m:t:r:n:h" opt; do
     case $opt in
@@ -71,7 +71,7 @@ run_once() { # $1 = spincount ; prints "pp tg"
 
 echo "spincount sweep: $SPINS  (reps=$REPS, bin=$BIN)"
 echo "warmup..." >&2
-run_once 25000 > /dev/null
+run_once 5000 > /dev/null
 
 printf '%-10s %12s %12s\n' "spincount" "pp t/s" "tg t/s"
 best_spin=""; best_tg=0

@@ -3985,16 +3985,19 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         // spin-waiting on every core starves the CUDA driver thread (measured -12% pp /
         // -5% tg vs no-numa). Fully passive waiting fixes TG but makes every CPU expert
         // segment pay thread-wake latency (~-10% pp). The sweet spot is a short spin
-        // (~25k iterations) before sleeping: pp gap gone, tg +16% vs no-numa — see
-        // docs/numa-testbed.md. GOMP_SPINCOUNT overrides the wait policy's spin count in
-        // libgomp; PASSIVE alone is the fallback for other OpenMP runtimes. Defaults only:
-        // if the user set either variable, respect their configuration entirely. Safe here
-        // because no OpenMP region has run yet, so the runtime hasn't latched its config.
+        // before sleeping. 5000 is the measured optimum on the dual-EPYC target (a
+        // desktop Zen 5 preferred 25000; more cores -> shorter spin wins, since idle
+        // spinners cost more when there are 190 of them). Re-tune per machine with
+        // scripts/tune-spincount.sh. GOMP_SPINCOUNT overrides the wait policy's spin
+        // count in libgomp; PASSIVE alone is the fallback for other OpenMP runtimes.
+        // Defaults only: if the user set either variable, respect their configuration
+        // entirely. Safe here because no OpenMP region has run yet, so the runtime
+        // hasn't latched its config.
         if (params.n_gpu_layers > 0 &&
             getenv("OMP_WAIT_POLICY") == nullptr && getenv("GOMP_SPINCOUNT") == nullptr) {
             setenv("OMP_WAIT_POLICY", "PASSIVE", 0);
-            setenv("GOMP_SPINCOUNT", "25000", 0);
-            fprintf(stderr, "%s: NUMA mirror + GPU offload: defaulting OMP_WAIT_POLICY=PASSIVE, GOMP_SPINCOUNT=25000\n", __func__);
+            setenv("GOMP_SPINCOUNT", "5000", 0);
+            fprintf(stderr, "%s: NUMA mirror + GPU offload: defaulting OMP_WAIT_POLICY=PASSIVE, GOMP_SPINCOUNT=5000\n", __func__);
         }
 #endif
     }
