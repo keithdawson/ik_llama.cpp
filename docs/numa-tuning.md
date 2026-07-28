@@ -15,6 +15,8 @@ A scripted harness that automates most of this is in [`scripts/numa-ab.py`](../s
 | `--numa-gpu-node N` | ggml context arenas (tensor metadata) → node N | negligible; prerequisite for the next flag |
 | `--numa-bind-compute` | scheduler CPU compute buffers (intermediate tensor data — what the GPU DMAs from/to) → node N | GPU transfers become node-local, but expert threads on *other* nodes write outputs remotely |
 | `GGML_NUMA_PIN=cpu` (env) | pins each mirror thread to one *specific* CPU instead of "anywhere on its node" | no cross-CCD thread migration (each EPYC CCD has its own L3), physical cores before SMT siblings — but the scheduler loses the freedom to dodge other load on the socket |
+| `--numa-mirror dense,kv` | routed experts get **one** copy, pinned per node, instead of a copy on every node | the only way to run an MoE too large to mirror; costs TG throughput to routing imbalance — see [Expert sharding and rebalancing](#expert-sharding-and-rebalancing---numa-mirror-dense) |
+| `GGML_NUMA_SHARD_STEAL=1` (env) | rebalances each MoE op's experts across nodes when routing lands lopsided | recovers most of that imbalance and stays bit-identical, but needs `GGML_NUMA_SHARD_STEAL_COST` set from a measured `r` |
 
 `--numa-bind-compute` and `GGML_NUMA_PIN=cpu` are the experiments: whether they help
 depends on batch size, cache behavior, and what else runs on the box. Measure, don't
@@ -64,6 +66,119 @@ environment: { OMP_WAIT_POLICY: PASSIVE, GOMP_SPINCOUNT: "<best>" }
 Re-tune if the thread count, model, or GPU/CPU split changes materially — the optimum
 tracks how long the per-layer GPU segments are relative to thread wake latency.
 
+## Expert sharding and rebalancing (`--numa-mirror dense`)
+
+Only relevant for MoE models **too large to mirror**. If `2 × weights` fits in RAM, use
+`--numa mirror` and skip this section — sharding is a way to fit, not a way to go faster.
+
+### What sharding does
+
+`--numa-mirror dense,kv` mirrors everything *except* the routed experts. Those keep a single
+copy, with expert `e` pinned to node `e % n_nodes`, so the footprint becomes
+`dense × n_nodes + experts × 1` instead of `everything × n_nodes`. The MoE kernels then compute
+expert `e` only on that node's threads, so its weight reads stay node-local.
+
+Shared experts (`*_shexp`) are **not** sharded — they are active on every token, so they stay
+mirrored (and can sit on the GPU instead; `--cpu-moe` only matches `*_exps`). The boot log says
+which: `NUMA shard: N shared-expert tensors (X GiB) mirrored, not sharded`.
+
+### The cost you are buying: routing imbalance
+
+GLM-5.2 routes each token to **8 of 256** experts. Under `e % 2` those 8 split by parity —
+sometimes 4/4, often 5/3, sometimes 6/2. Every MoE op ends at a barrier, so **the op runs at
+the pace of the busier node** and the lighter one idles.
+
+That is what `GGML_NUMA_STATS=1` reports as `moe_node_skew_mean` (`1.00` = perfect split,
+`2.00` = one node did everything). Measured on the testbed: **TG ≈ 1.25–1.32**, PP ≈ 1.07 —
+prompt processing averages out because every expert gets rows, token generation does not.
+
+> Do **not** read `moe_experts=` (the cumulative per-node totals) as the balance figure. It
+> averages out to ~1.01 over a run and looks perfect even when every individual op was lopsided.
+> `moe_node_skew_mean` is the number that matters.
+
+The skew counter works with sharding **off**, so a plain `--numa mirror` run predicts what
+sharding would cost on your model before you commit to it.
+
+### Rebalancing it away: `GGML_NUMA_SHARD_STEAL=1` (default off)
+
+The idle node can take work off the busy one instead of waiting. The obvious way — let a node
+finish and then grab leftover work — fits badly here: a node's threads all cooperate on *one*
+expert, splitting its rows, so "node B takes expert X" needs all ~64 of B's threads to agree
+mid-flight. That needs a synchronization point (the cost we are trying to remove), and the row
+split would depend on which threads arrived first, so output would drift run to run.
+
+Instead the assignment is decided **up front**. How much work each expert represents is already
+known before any of it starts — `matrix_row_counts[e]`, the number of token-rows routed to
+expert `e`, is filled by thread 0 and published by the barrier that already precedes the expert
+loop. So every thread runs the same greedy pass over the same table and reaches the same
+assignment, with no atomics, no extra barrier, and no coordination.
+
+> Two workers splitting a pile of tasks can grab them as they free up — which needs constant
+> checking so they don't collide — or both read the whole list at the start and independently
+> work out the same split. Same rule, same list, same plan, no talking.
+
+Each expert is still computed start to finish by one node; only *which* node can change. The
+arithmetic is untouched, so **output stays bit-identical** and the smoke gate's byte-identity
+check still applies.
+
+### Setting `GGML_NUMA_SHARD_STEAL_COST` (`r`)
+
+Moving expert `X` off its owner makes its weight reads cross-socket. `r` is how much slower that
+is (`1.0` = free, `2.0` = twice the cost). Worked through a 5/3 split, one unit per expert:
+
+| | busy node | idle node | op takes |
+|---|---|---|---|
+| do nothing | 5 | 3 | **5** |
+| move one, `r = 1.0` | 4 | 3 + 1.0 = 4 | **4** ✅ |
+| move one, `r = 1.5` | 4 | 3 + 1.5 = 4.5 | **4.5** ✅ |
+| move one, `r = 2.0` | 4 | 3 + 2.0 = 5 | **5** — no gain |
+| move one, `r = 3.0` | 4 | 3 + 3.0 = 6 | **6** ❌ worse |
+
+The greedy pass runs exactly this comparison and moves only when the predicted time strictly
+drops. So the algorithm is **self-limiting**: if remote reads are expensive on your machine it
+declines to move at all rather than making things worse. Setting `r` too *high* costs you
+nothing but the missed opportunity; setting it too *low* is the failure mode, because it
+over-moves and pays more in remote reads than it recovers in idle time.
+
+Effect on the testbed (`skew_after`, remote penalty included):
+
+| `r` | Qwen1.5-MoE | gemma-4-26B |
+|---|---|---|
+| 1.0 | 1.34 → **1.00** | 1.25 → **1.00** |
+| 1.3 | → 1.05 | → 1.04 |
+| 1.5 (default) | → 1.09 | → 1.07 |
+| 2.0 | → 1.24 | → 1.13 |
+
+### Measuring `r` on the real machine
+
+**This has not been measured on Pandora yet**, which is why the knob ships off. The testbed
+cannot answer it: under a fake topology `mbind` is a no-op, so every "remote" read is really
+local. Three runs at identical model, threads, context and prompt:
+
+```sh
+A: --numa mirror                                      # all local, balanced
+B: --numa-mirror dense,kv  GGML_NUMA_SHARD_SCHED=0    # same schedule, ~half the reads remote
+C: --numa-mirror dense,kv                             # node-aware, local, imbalanced
+```
+
+`GGML_NUMA_SHARD_SCHED=0` keeps stage-1 placement but restores the old schedule, so A and B do
+the *same* work in the *same* split and differ only in locality — which is what isolates the
+penalty instead of confounding it with imbalance.
+
+- **`r ≈ B/A`** (on the TG number; that is where the skew bites).
+- **`C/A`** is what node-aware scheduling nets today, after paying the skew.
+
+Then set `GGML_NUMA_SHARD_STEAL_COST` to the measured `r`, enable
+`GGML_NUMA_SHARD_STEAL=1`, and confirm with `GGML_NUMA_STATS=1`:
+
+```
+numa_stats: moe_rebalance=1 cost=1.50 moves=648 (0.59 per op) skew_after=1.087 (from 1.340)
+```
+
+`moe_node_skew_mean` deliberately keeps scoring the untouched `e % n_nodes` split, so
+before → after stays comparable across runs. Both knobs are env vars — no rebuild to change
+either.
+
 ## Pandora validation suite (`scripts/pandora-tune.sh`)
 
 Every knob that the fake-NUMA testbed shipped needs one confirmation sweep on the real
@@ -95,6 +210,11 @@ Recommended order and where each answer goes:
 
 `all` runs 1–5 (plus 7–8 when hybrid flags are passed). Lists are overridable via env
 (`GATE_LIST`, `COPY_THREADS_LIST`, `NT_LIST`, `THREADS_LIST`, `RESERVE_LIST`).
+
+The expert-sharding knobs (`--numa-mirror dense`, `GGML_NUMA_SHARD_STEAL[_COST]`) have **no
+`pandora-tune.sh` subcommand yet** — they only matter for models that cannot be mirrored, and
+their one measurement is the three-run A/B in
+[Expert sharding and rebalancing](#expert-sharding-and-rebalancing---numa-mirror-dense).
 
 ### Measured on Pandora — GLM 5.2, 2× EPYC 9665 (2026-07)
 
