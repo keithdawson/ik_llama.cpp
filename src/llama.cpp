@@ -4712,7 +4712,11 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
     try {
         // NUMA weight mirroring needs writable, owned (non-mmap) weight buffers: the per-node
         // copies are made from the repacked bytes, and repacking only runs for non-mmap loads.
-        if (params.use_mmap && ggml_numa_mirror_active() && (ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS)) {
+        // The dense/shard mode needs it for a second reason: expert placement is done with
+        // mbind(MPOL_MF_MOVE), which cannot relocate the shared page-cache pages behind a file
+        // mapping, so with mmap the sharding would silently not happen.
+        if (params.use_mmap && ggml_numa_mirror_active() &&
+                (ggml_numa_get_mirror() & (GGML_NUMA_MIRROR_WEIGHTS | GGML_NUMA_MIRROR_DENSE))) {
             LLAMA_LOG_INFO("%s: NUMA mirror: forcing --no-mmap so weights can be duplicated per node\n", __func__);
             params.use_mmap = false;
         }
@@ -7600,8 +7604,158 @@ static size_t llama_get_available_ram_bytes() { return 0; }
 // Duplicate the model's host weight buffers once per NUMA node and point each weight tensor at its
 // per-node copies (see ggml_numa_tensor_data). Must run AFTER all weight repacking (load-time and
 // the context-time up/gate merge) so the mirrored bytes are final. Idempotent per model.
+// Routed ("merged") expert weight tensors: the ones whose last dimension indexes the expert.
+// Deliberately excludes ffn_norm_exps (a tiny per-layer norm) and every *_shexp shared-expert
+// tensor -- those are read on every token by every thread, so they belong in the mirrored set
+// with the rest of the dense weights.
+static bool llama_numa_is_routed_expert(const struct ggml_tensor * t) {
+    const char * n = t->name;
+    return strstr(n, "ffn_gate_up_exps") || strstr(n, "ffn_gate_exps") ||
+           strstr(n, "ffn_up_exps")      || strstr(n, "ffn_down_exps");
+}
+
+// Pin each expert's slice of a merged expert tensor to an owner node.
+//
+// All experts of a layer live in ONE [n_embd, n_ff, n_expert] tensor and expert e is the byte
+// range [e*nb[2], (e+1)*nb[2]) (see ggml_compute_forward_mul_mat_id: src0_cur = src0_data +
+// cur_a*nb02). So "expert e lives on node N" is a placement property of a single copy, set with
+// mbind -- not a second copy. The mirror table is left empty for these tensors, so
+// ggml_numa_tensor_data() keeps returning t->data on every node.
+//
+// owner(e) = e % n_nodes is layer-independent on purpose: expert e sits on the same node in
+// every layer, so stage-2 scheduling can derive the owner arithmetically with no lookup table.
+static int llama_numa_shard_expert_tensor(struct ggml_tensor * t, int n_nodes, size_t * per_node_bytes) {
+    const int64_t n_expert = t->ne[2];
+    if (n_expert < 2) {
+        return 0; // not actually a merged-expert layout; leave it where the loader put it
+    }
+    const size_t stride = t->nb[2];
+    // Trim each slice to whole pages: mbind rounds the start down to a page boundary, which
+    // would otherwise let expert e's binding claim the tail page of expert e-1.
+    const size_t pg = 4096;
+    for (int64_t e = 0; e < n_expert; ++e) {
+        const size_t beg = GGML_PAD((size_t) (e * stride), pg);
+        const size_t end = ((size_t) ((e + 1) * stride)) & ~(pg - 1);
+        const int node = (int) (e % n_nodes);
+        if (end > beg) {
+            ggml_numa_bind((char *) t->data + beg, end - beg, node);
+        }
+        per_node_bytes[node] += stride;
+    }
+    return (int) n_expert;
+}
+
+// --numa-mirror dense: mirror every weight EXCEPT the routed experts, which instead get a
+// single copy pinned to an owner node. Weight footprint becomes dense*n_nodes + experts*1,
+// which is what lets a ~1.5 TB MoE run on a box that cannot hold 2x of it.
+//
+// Unlike the all-weights path below, this cannot work at buffer granularity: dense and expert
+// tensors share the same backend buffers, so skipping experts requires per-tensor placement.
+// Dense tensors are copied into one arena per node; experts are never copied, only bound.
+static void llama_mirror_dense_shard_experts(const llama_model & model, int n_nodes) {
+    const size_t align = 64; // keep every arena slot AVX-512-aligned
+
+    // pass 1: classify and size
+    size_t dense_bytes = 0, expert_bytes = 0;
+    int n_dense_t = 0, n_expert_t = 0;
+    for (struct ggml_context * ctx : model.ctxs) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const size_t nb = ggml_nbytes(t);
+            if (llama_numa_is_routed_expert(t)) {
+                expert_bytes += nb;
+                ++n_expert_t;
+            } else {
+                dense_bytes += GGML_PAD(nb, align);
+                ++n_dense_t;
+            }
+        }
+    }
+    if (dense_bytes == 0) {
+        return;
+    }
+
+    const size_t extra_needed = dense_bytes * (size_t) (n_nodes - 1); // node 0 reads the originals
+    const size_t avail = llama_get_available_ram_bytes();
+    LLAMA_LOG_INFO("%s: NUMA mirror: %d nodes, dense weights %.2f GiB (%d tensors), routed experts %.2f GiB (%d tensors, sharded); "
+            "need +%.2f GiB for mirrors (%.2f GiB available)\n",
+            __func__, n_nodes, dense_bytes/1073741824.0, n_dense_t, expert_bytes/1073741824.0, n_expert_t,
+            extra_needed/1073741824.0, avail/1073741824.0);
+    if (avail > 0 && extra_needed + (2ull << 30) > avail) {
+        LLAMA_LOG_WARN("%s: NUMA mirror: insufficient free RAM to duplicate dense weights across %d nodes; "
+                "continuing WITHOUT weight mirroring\n", __func__, n_nodes);
+        return;
+    }
+
+    // one arena per remote node, freed by ~llama_model (which skips node_base[0])
+    llama_model::numa_mirror_buffer mb;
+    mb.buf  = nullptr; // arena-backed, not a duplicate of any one backend buffer
+    mb.size = dense_bytes;
+    for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+        mb.node_base[n] = NULL;
+    }
+    for (int n = 1; n < n_nodes; ++n) {
+        void * p = ggml_numa_alloc(dense_bytes, n);
+        if (!p) {
+            for (int k = 1; k < n; ++k) {
+                ggml_numa_free(mb.node_base[k], dense_bytes);
+            }
+            LLAMA_LOG_WARN("%s: NUMA mirror: allocation failed; continuing WITHOUT weight mirroring\n", __func__);
+            return;
+        }
+        mb.node_base[n] = p;
+    }
+    model.numa_mirror_bufs.push_back(mb);
+
+    // pass 2: copy dense tensors into every arena, shard experts in place
+    size_t off = 0;
+    int n_mirrored = 0, n_sharded = 0;
+    size_t per_node_expert[GGML_NUMA_MAX_NODES] = {0};
+    for (struct ggml_context * ctx : model.ctxs) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const size_t nb = ggml_nbytes(t);
+            if (llama_numa_is_routed_expert(t)) {
+                n_sharded += llama_numa_shard_expert_tensor(t, n_nodes, per_node_expert);
+                continue;
+            }
+            void * node_data[GGML_NUMA_MAX_NODES];
+            for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+                node_data[n] = NULL;
+            }
+            node_data[0] = t->data;             // node 0 reads the original ...
+            ggml_numa_bind(t->data, nb, 0);     // ... migrated onto node 0 (best effort)
+            for (int n = 1; n < n_nodes; ++n) {
+                node_data[n] = (char *) mb.node_base[n] + off;
+                ggml_numa_memcpy_to_node(node_data[n], t->data, nb, n);
+            }
+            ggml_numa_tensor_set_mirror(t, node_data);
+            off += GGML_PAD(nb, align);
+            ++n_mirrored;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: NUMA mirror: duplicated %d weight tensors across %d nodes\n",
+            __func__, n_mirrored, n_nodes);
+    char dist[256];
+    int  pos = 0;
+    for (int n = 0; n < n_nodes && pos < (int) sizeof(dist) - 32; ++n) {
+        pos += snprintf(dist + pos, sizeof(dist) - pos, "%snode%d %.2f GiB",
+                n ? ", " : "", n, per_node_expert[n]/1073741824.0);
+    }
+    LLAMA_LOG_INFO("%s: NUMA shard: pinned %d expert slices across %d nodes (%s)\n",
+            __func__, n_sharded, n_nodes, dist);
+}
+
 static void llama_mirror_model_weights(const llama_model & model) {
-    if (!ggml_numa_mirror_active() || !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS)) {
+    const uint32_t flags = ggml_numa_get_mirror();
+    const bool mirror_all   = (flags & GGML_NUMA_MIRROR_WEIGHTS) != 0;
+    const bool mirror_dense = !mirror_all && (flags & GGML_NUMA_MIRROR_DENSE) != 0;
+    if (!ggml_numa_mirror_active() || (!mirror_all && !mirror_dense)) {
         return;
     }
     if (!model.numa_mirror_bufs.empty()) {
@@ -7609,6 +7763,10 @@ static void llama_mirror_model_weights(const llama_model & model) {
     }
     const int n_nodes = ggml_numa_node_count();
     if (n_nodes < 2) {
+        return;
+    }
+    if (mirror_dense) {
+        llama_mirror_dense_shard_experts(model, n_nodes);
         return;
     }
 

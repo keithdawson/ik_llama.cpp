@@ -912,9 +912,16 @@ extern "C" {
     // which read-mostly data to duplicate per NUMA node when GGML_NUMA_STRATEGY_MIRROR is active.
     // these are bit flags so they can be OR-ed together (see ggml_numa_set_mirror).
     enum ggml_numa_mirror_flags {
-        GGML_NUMA_MIRROR_WEIGHTS     = 1 << 0, // model weight tensors
+        GGML_NUMA_MIRROR_WEIGHTS     = 1 << 0, // model weight tensors (routed experts included)
         GGML_NUMA_MIRROR_KV          = 1 << 1, // K/V cache
         GGML_NUMA_MIRROR_ACTIVATIONS = 1 << 2, // reserved: per-node matmul scratch (not implemented)
+        // mirror every weight EXCEPT the routed-expert tensors, which instead get a single
+        // copy pinned to one owner node ("expert-affinity sharding"). Total weight footprint
+        // is then dense*n_nodes + experts*1 instead of everything*n_nodes, which is what makes
+        // a ~1.5 TB MoE fit on a 2.25 TB box. Correctness is free: a sharded tensor is just a
+        // mirror with one populated slot, and ggml_numa_tensor_data() already falls back to
+        // t->data (a remote read) for the NULL slots. Ignored if WEIGHTS is also set.
+        GGML_NUMA_MIRROR_DENSE       = 1 << 3,
         GGML_NUMA_MIRROR_ALL = GGML_NUMA_MIRROR_WEIGHTS | GGML_NUMA_MIRROR_KV,
     };
 

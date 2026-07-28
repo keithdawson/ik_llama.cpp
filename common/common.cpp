@@ -2266,6 +2266,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             else if (item == "none")        { mask  = 0; }
             else if (item == "weights")     { mask |= GGML_NUMA_MIRROR_WEIGHTS; }
             else if (item == "kv")          { mask |= GGML_NUMA_MIRROR_KV; }
+            else if (item == "dense")       { mask |= GGML_NUMA_MIRROR_DENSE; }
             else { ok = false; }
         }
         if (!ok) { invalid_param = true; return true; }
@@ -3323,7 +3324,10 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
     options.push_back({ "*",           "       --numa-mirror LIST",     "comma list selecting what to mirror with --numa mirror:\n"
-                                                                        "  weights, kv, all, none (default: all). implies --numa mirror" });
+                                                                        "  weights, kv, dense, all, none (default: all). implies --numa mirror\n"
+                                                                        "  'dense' mirrors every weight EXCEPT the routed experts, which get one\n"
+                                                                        "  copy pinned to an owner node (expert-affinity sharding). Use for MoE\n"
+                                                                        "  models too large to duplicate: footprint is dense*nodes + experts*1" });
     options.push_back({ "*",           "       --numa-gpu-node N",      "with --numa mirror, bind non-mirrored host buffers to the NUMA node the GPU\n"
                                                                         "is attached to (memory placement only; compute uses all nodes)" });
     options.push_back({ "*",           "       --numa-bind-compute",    "with --numa-gpu-node, also bind the CPU compute buffers (data the GPU\n"
