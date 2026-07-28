@@ -782,6 +782,15 @@ class GGUFWriter:
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
 
+    def add_attention_indexer_head_count(self, count: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_HEAD_COUNT.format(arch=self.arch), count)
+
+    def add_attention_indexer_key_length(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_KEY_LENGTH.format(arch=self.arch), length)
+
+    def add_attention_indexer_top_k(self, top_k: int) -> None:
+        self.add_uint32(Keys.Attention.INDEXER_TOP_K.format(arch=self.arch), top_k)
+
     def add_swin_norm(self, value: bool) -> None:
         self.add_bool(Keys.LLM.SWIN_NORM.format(arch=self.arch), value)
 
@@ -850,6 +859,9 @@ class GGUFWriter:
 
     def add_attention_scale(self, value: float) -> None:
         self.add_float32(Keys.Attention.SCALE.format(arch=self.arch), value)
+
+    def add_attention_value_scale(self, value: float) -> None:
+        self.add_float32(Keys.Attention.VALUE_SCALE.format(arch=self.arch), value)
 
     def add_attn_output_scale(self, value: float) -> None:
         self.add_float32(Keys.Attention.OUTPUT_SCALE.format(arch=self.arch), value)

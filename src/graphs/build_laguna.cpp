@@ -8,18 +8,26 @@ ggml_cgraph * llm_build_context::build_laguna() {
     ggml_tensor * inpL        = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
+    const bool needs_dflash_full_final_rows = lctx.dflash.capture != nullptr;
     ggml_tensor * KQ_mask     = build_inp_KQ_mask();
-    ggml_tensor * KQ_mask_swa = build_inp_KQ_mask_swa();
+    // Laguna M.1 has only global-attention layers and leaves n_swa at zero; building
+    // the SWA mask in that case trips the generic SWA precondition.
+    ggml_tensor * KQ_mask_swa = hparams.n_swa > 0 ? build_inp_KQ_mask_swa() : nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
         const bool is_swa = hparams.swa_layers[il];
         const int n_swa_l = is_swa ? hparams.n_swa : 0;
 
         auto KQ_mask_l = is_swa ? KQ_mask_swa : KQ_mask;
+        // If a future Laguna GGUF marks SWA layers, it must also carry a real
+        // sliding-window size so those layers get an SWA mask.
+        GGML_ASSERT(KQ_mask_l != nullptr);
         auto rope_factors = is_swa ? nullptr : build_rope_factors(il);
 
+        const bool is_final_layer = il == n_layer - 1;
+        ggml_tensor * attn_out_ids = is_final_layer && !needs_dflash_full_final_rows ? inp_out_ids : nullptr;
         auto cur = build_std_attention(gf, model.layers[il].attn_norm, inpL,
-                        inp_pos, il == n_layer - 1 ? inp_out_ids : nullptr, rope_factors,
+                        inp_pos, attn_out_ids, rope_factors,
                         KQ_mask_l, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head_k)), 0.0f, n_swa_l, il, true, false, true);
 
         if (model.layers[il].ffn_gate_inp == nullptr) {
@@ -47,6 +55,11 @@ ggml_cgraph * llm_build_context::build_laguna() {
 
         cur = lctx.cvec.apply_to(ctx0, cur, il);
         cb(cur, "l_out", il);
+
+        if (is_final_layer && needs_dflash_full_final_rows && inp_out_ids != nullptr) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+            cb(cur, "l_out_selected", il);
+        }
 
         inpL = cur;
     }

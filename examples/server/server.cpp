@@ -763,6 +763,25 @@ int main(int argc, char ** argv) {
                     }
 
                     res.set_content(health.dump(), "application/json");
+
+                    const char * hotswap_env = std::getenv("LLAMA_HOTSWAP_ENABLED");
+                    if (hotswap_env) {
+                        // WARNING: llama_reload_changed_tensors is NOT thread-safe with active inference.
+                        // Best effort: only attempt the reload when no slot is processing (a request
+                        // arriving between the metrics snapshot and the reload can still race it).
+                        if (n_processing_slots > 0) {
+                            LOG_INFO("hotswap: skipping tensor reload, slots are processing", {{"processing", n_processing_slots}});
+                        } else if (llama_reload_changed_tensors(ctx_server.ctx)) {
+                            // KV cache entries and cached prompts were computed with the
+                            // previous weights; drop them so they cannot be reused.
+                            ctx_server.kv_cache_clear();
+                            for (auto & slot : ctx_server.slots) {
+                                slot.cache_tokens.clear();
+                            }
+                            LOG_INFO("hotswap: tensors reloaded; KV cache and cached prompts cleared", {});
+                        }
+                    }
+
                     break;
                 }
             case SERVER_STATE_LOADING_MODEL:
@@ -2110,12 +2129,14 @@ int main(int argc, char ** argv) {
     svr->Get ("/props",               handle_props);
     svr->Get("/v1/props",             handle_props_simple);
     svr->Get ("/v1/models",           handle_models);
+    svr->Get ("/models",              handle_models);
     svr->Post("/completion",          handle_completions); // legacy
     svr->Post("/completions", handle_completions); // legacy
     svr->Post("/v1/completions",     handle_completions_oai);
     svr->Post("/chat/completions",    handle_chat_completions);
     svr->Post("/v1/chat/completions", handle_chat_completions);
     svr->Post("/v1/responses",        handle_responses);
+    svr->Post("/responses",           handle_responses);
     svr->Post("/v1/messages",         handle_anthropic_messages);
     svr->Post("/v1/messages/count_tokens", handle_anthropic_count_tokens);
     svr->Post("/infill",              handle_infill);

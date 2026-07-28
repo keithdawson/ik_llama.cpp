@@ -47,10 +47,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 9
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 3
+#define LLAMA_STATE_SEQ_VERSION 4
 
 #define LLAMA_SERVER_MAGIC 0x6c6d7376u // 'lmsv'
 #define LLAMA_SERVER_VERSION 1
@@ -241,6 +241,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_IQ5_K_R4      = 341, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ4_KS_R4     = 345, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_IQ5_KS_R4     = 350, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_MXFP4_R8      = 351, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_KV_R8      = 398, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q8_K_R8       = 399, // except 1d tensors
 
@@ -378,6 +379,7 @@ extern "C" {
 
         enum ggml_type type_k;
         enum ggml_type type_v;
+        enum ggml_type idx_type_k;
         uint32_t max_ctx_size;
         int32_t  n_seq_max;
         int32_t  n_ubatch;
@@ -465,6 +467,7 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        enum ggml_type idx_type_k; // data type for indexer K cache [EXPERIMENTAL]
         enum ggml_type type_reduce; // data type for reduce operations
         enum ggml_type type_graph_attn; // flash-attn precision under -sm graph
         enum ggml_type type_k_first;
@@ -489,9 +492,14 @@ extern "C" {
         bool fused_mmad;        // whether to use fused mul+multi_add op [EXPERIMENTAL]
         bool rope_cache;        // whether to use RoPE cache [EXPERIMENTAL]
         bool graph_reuse;       // whether to reuse graphs when possible [EXPERIMENTAL]
+        bool dsa;               // enable GLM DSA sparse attention (off by default) [EXPERIMENTAL]
+        bool fused_idx_topk;    // enable the fused indexer topk op (off by default) [EXPERIMENTAL]
+        int  dsa_top_k;         // DSA top-k override (<0 => model's configured indexer_top_k) [EXPERIMENTAL]
         int  min_experts;
         float thresh_experts;
         bool only_active_experts;
+        bool prefetch_experts;  // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
+        int  prefetch_experts_threads; // number of expert prefetch workers (<=0 = auto)
         bool k_cache_hadamard;  // if true, apply Hadamard transfrom to K-cache
         bool v_cache_hadamard;  // if true, apply Hadamard transfrom to V-cache (needs FA)
         bool split_mode_graph_scheduling; // if true, force split mode graph scheduling
@@ -516,6 +524,7 @@ extern "C" {
         enum llama_ftype ftype;              // quantize to this llama_ftype
         enum ggml_type output_tensor_type;   // output tensor type
         enum ggml_type token_embedding_type; // token embeddings tensor type
+        enum ggml_type per_layer_token_embedding_type; // token embeddings tensor type
         enum ggml_type attn_q_type;          // attention query tensor type
         enum ggml_type attn_k_type;          // attention key tensor type
         enum ggml_type attn_v_type;          // attention value tensor type
@@ -691,12 +700,24 @@ extern "C" {
 
     LLAMA_API bool llama_model_has_recurrent(const struct llama_model * model);
 
+    // Returns true if the model is openPangu (conv-only recurrent state that rides the spec-rollback checkpoint)
+    LLAMA_API bool llama_model_is_openpangu(const struct llama_model * model);
+
     // Returns true if the model is a Gemma 4 MTP assistant (external frozen-KV speculative drafter)
     LLAMA_API bool llama_model_is_gemma4_mtp_assistant(const struct llama_model * model);
 
     LLAMA_API bool llama_is_gemma4_mtp_file(const char * path);
 
     LLAMA_API bool llama_model_is_split_mode_graph(const struct llama_model * model);
+
+    // Returns false for models whose KV cache cannot be re-positioned after the fact
+    // (K-shift / context shift / self-extend), e.g. openPangu's latent cache.
+    LLAMA_API bool llama_model_supports_ctx_shift(const struct llama_model * model);
+
+    // Returns false for models that can only reuse a cached sequence as a pure extension:
+    // rewinding into the middle of a decoded sequence loses per-position side state
+    // (e.g. openPangu keeps only the current recurrent conv state).
+    LLAMA_API bool llama_model_supports_partial_kv_reuse(const struct llama_model * model);
 
     LLAMA_API const char * llama_model_arch_string(const struct llama_model * model);
 
@@ -1578,6 +1599,8 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API void llama_set_mtp_op_type(struct llama_context * ctx, enum llama_mtp_op_type mtp_op_type);
 
     LLAMA_API void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float * hidden_state);
+
+    LLAMA_API bool llama_reload_changed_tensors(struct llama_context * ctx);
 
 #ifdef __cplusplus
 }

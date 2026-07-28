@@ -1199,7 +1199,9 @@ size_t server_tokens::size_up_to_pos(llama_pos max_pos) const {
 
     size_t idx = 0;
     llama_pos pos = 0;
-
+    if (pos >= max_pos) {
+        return idx;
+    }
     while (idx < tokens.size()) {
         const auto media_it = map_idx_to_media.find(idx);
         if (media_it != map_idx_to_media.end()) {
@@ -1251,6 +1253,13 @@ const mtmd::input_chunk_ptr& server_tokens::find_chunk(size_t idx) const {
         return it->second;
     }
     throw std::runtime_error("Chunk not found, or idx is not the first token of a chunk");
+}
+
+void server_tokens::free_raw_media_data(size_t idx) {
+    auto it = map_idx_to_media.find(idx);
+    if (it != map_idx_to_media.end() && it->second) {
+        mtmd_input_chunk_free_raw_data(it->second.get());
+    }
 }
 
 void server_tokens::push_back(llama_token tok) {
