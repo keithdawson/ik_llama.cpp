@@ -746,16 +746,16 @@ class TensorNameMap:
                 "model.layers.{bid}.mlp.e_score_correction",
             ),
             # DSA lightning indexer
-            MODEL_TENSOR.INDEXER_K_NORM: (
+            MODEL_TENSOR.PANGU_INDEXER_K_NORM: (
                 "model.layers.{bid}.self_attn.indexer.k_norm",
             ),
-            MODEL_TENSOR.INDEXER_PROJ: (
+            MODEL_TENSOR.PANGU_INDEXER_PROJ: (
                 "model.layers.{bid}.self_attn.indexer.weights_proj",
             ),
-            MODEL_TENSOR.INDEXER_ATTN_K: (
+            MODEL_TENSOR.PANGU_INDEXER_ATTN_K: (
                 "model.layers.{bid}.self_attn.indexer.wk",
             ),
-            MODEL_TENSOR.INDEXER_ATTN_Q_B: (
+            MODEL_TENSOR.PANGU_INDEXER_ATTN_Q_B: (
                 "model.layers.{bid}.self_attn.indexer.wq_b",
             ),
             # MoME causal convs
