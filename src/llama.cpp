@@ -7608,10 +7608,22 @@ static size_t llama_get_available_ram_bytes() { return 0; }
 // Deliberately excludes ffn_norm_exps (a tiny per-layer norm) and every *_shexp shared-expert
 // tensor -- those are read on every token by every thread, so they belong in the mirrored set
 // with the rest of the dense weights.
+//
+// The *_shexp exclusion is load-bearing, not incidental. Shared experts are active for every
+// token (GLM-5.2 has 1, Kimi K3 has 2 alongside its 16-of-896 routed), so mirroring them keeps
+// every node's copy local and, once expert compute is split across nodes, keeps them out of any
+// cross-node reduction: each node computes the shared expert redundantly from local weights and
+// adds it locally. Sharding them instead would put a permanently-hot tensor on one node and
+// drag it into the reduction. Note the names do not collide -- "ffn_up_shexp" does not contain
+// "ffn_up_exps" -- so substring matching is safe here.
 static bool llama_numa_is_routed_expert(const struct ggml_tensor * t) {
     const char * n = t->name;
     return strstr(n, "ffn_gate_up_exps") || strstr(n, "ffn_gate_exps") ||
            strstr(n, "ffn_up_exps")      || strstr(n, "ffn_down_exps");
+}
+
+static bool llama_numa_is_shared_expert(const struct ggml_tensor * t) {
+    return strstr(t->name, "shexp") != NULL;
 }
 
 // Pin each expert's slice of a merged expert tensor to an owner node.
@@ -7656,8 +7668,8 @@ static void llama_mirror_dense_shard_experts(const llama_model & model, int n_no
     const size_t align = 64; // keep every arena slot AVX-512-aligned
 
     // pass 1: classify and size
-    size_t dense_bytes = 0, expert_bytes = 0;
-    int n_dense_t = 0, n_expert_t = 0;
+    size_t dense_bytes = 0, expert_bytes = 0, shexp_bytes = 0;
+    int n_dense_t = 0, n_expert_t = 0, n_shexp_t = 0;
     for (struct ggml_context * ctx : model.ctxs) {
         for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
             if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
@@ -7670,6 +7682,10 @@ static void llama_mirror_dense_shard_experts(const llama_model & model, int n_no
             } else {
                 dense_bytes += GGML_PAD(nb, align);
                 ++n_dense_t;
+                if (llama_numa_is_shared_expert(t)) { // subset of the dense set, reported separately
+                    shexp_bytes += nb;
+                    ++n_shexp_t;
+                }
             }
         }
     }
@@ -7755,6 +7771,14 @@ static void llama_mirror_dense_shard_experts(const llama_model & model, int n_no
     }
     LLAMA_LOG_INFO("%s: NUMA shard: pinned %d expert slices across %d nodes (%s)\n",
             __func__, n_sharded, n_nodes, dist);
+    // Called out explicitly because it is the property that keeps shared experts off the
+    // cross-node reduction path: they are active every token, so they stay replicated.
+    if (n_shexp_t > 0) {
+        LLAMA_LOG_INFO("%s: NUMA shard: %d shared-expert tensors (%.2f GiB) mirrored, not sharded\n",
+                __func__, n_shexp_t, shexp_bytes/1073741824.0);
+    } else {
+        LLAMA_LOG_INFO("%s: NUMA shard: model has no shared-expert tensors\n", __func__);
+    }
 }
 
 static void llama_mirror_model_weights(const llama_model & model) {
