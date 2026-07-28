@@ -4627,6 +4627,7 @@ static int g_numa_stats_level = 0; // 0=off, 1=dump at exit, 2=also dump+reset p
 // GGML_NUMA_NT_COPY=1: use non-temporal stores in the explicit cross-node copies so populating
 // a multi-GiB mirror streams at DRAM write bandwidth instead of evicting the entire L3 (E5)
 static bool g_numa_nt_copy = false;
+static int  g_numa_shard_sched = 1; // GGML_NUMA_SHARD_SCHED=0 disables node-aware MoE scheduling
 
 // GGML_NUMA_HIER_BATCH_MAX: batches larger than this use the flat barrier, smaller ones the
 // NUMA-hierarchical barrier when it's active. 32 matches the original hardcoded gate; negative
@@ -5069,6 +5070,12 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
             g_numa_nt_copy = true;
             GGML_PRINT("%s: non-temporal stores enabled for cross-node copies (GGML_NUMA_NT_COPY)\n", __func__);
         }
+        s = getenv("GGML_NUMA_SHARD_SCHED");
+        if (s && *s && strcmp(s, "0") == 0) {
+            g_numa_shard_sched = 0;
+            GGML_PRINT("%s: node-aware MoE scheduling DISABLED (GGML_NUMA_SHARD_SCHED=0); sharded experts "
+                       "will be computed by every node with remote reads - measurement only\n", __func__);
+        }
         s = getenv("GGML_NUMA_HIER_BATCH_MAX");
         if (s && *s) {
             g_numa_hier_batch_max = (int) strtol(s, NULL, 10);
@@ -5256,7 +5263,12 @@ bool ggml_numa_expert_shard_active(void) {
 static inline bool ggml_numa_expert_scope(int cur_a, int ith, int nth, int * e_ith, int * e_nth) {
     *e_ith = ith;
     *e_nth = nth;
-    if (!g_numa_expert_shard) {
+    if (!g_numa_expert_shard || !g_numa_shard_sched) {
+        // GGML_NUMA_SHARD_SCHED=0 keeps stage-1 placement but restores the old schedule (every
+        // node computes every expert), so ~half the expert reads are remote. Paired against
+        // --numa mirror -- same work split, only locality differs -- it isolates the remote-read
+        // penalty on real hardware, which is the number that decides whether an idle node is
+        // better off stealing work than waiting. Tuning knob; leave at 1 for serving.
         return true;
     }
     const int n_nodes = (int) g_state.numa.n_nodes;

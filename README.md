@@ -125,7 +125,8 @@ their defaults) plus the tooling to pick their values for a specific machine:
 | `GGML_NUMA_COPY_MIN_MB` | 64 | below this size a single memcpy is used |
 | `GGML_NUMA_NT_COPY` | off | `1` = non-temporal (streaming) stores for the explicit cross-node copies |
 | `GGML_NUMA_HUGETLB` | off | `1` = back mirror allocations with explicit 2 MiB hugetlb pages (needs `vm.nr_hugepages`; falls back to THP) |
-| `GGML_NUMA_STATS` | off | `1` = dump mirror-path counters at exit (incl. a per-expert MoE routing census); `2` = also per `llama_print_timings` |
+| `GGML_NUMA_SHARD_SCHED` | 1 | with `--numa-mirror dense`, `0` keeps expert placement but restores the old schedule (every node computes every expert, ~half the reads remote). Measurement only: paired against `--numa mirror` it isolates the remote-read penalty on your hardware |
+| `GGML_NUMA_STATS` | off | `1` = dump mirror-path counters at exit (incl. a per-expert MoE routing census and `moe_node_skew_*`); `2` = also per `llama_print_timings` |
 | `GGML_NUMA_FAKE` | unset | testbed only: fabricate N NUMA nodes on a 1-node box (see `docs/numa-testbed.md`) |
 | `GGML_NUMA_XGMI_GBPS` | unset | testbed only: cap explicit cross-node copies to model the socket interconnect |
 
