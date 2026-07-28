@@ -161,6 +161,8 @@ that is low-parallelism ops (nth < n_threads) always landing on the lowest threa
 | E6 copy threads | default correct (max threads, clamped to node CPUs); sweep `GGML_NUMA_COPY_THREADS` 16→32 on Pandora | 1t 2.4 / 2t 10 / 4t 14.6 GB/s |
 | E11 expert census | expert traffic is **nearly uniform** (gemma-4: 128 experts, ~8 active/token, CV≈0.33, top-8 experts carry 10.6%; greedy 2-way shard = 49.9/50.1) → per-node expert *sharding* is aggregate-balanced and would halve mirror RAM; per-token imbalance (binomial split of ~8 experts) makes it a TG latency risk, so mirror stays right for gemma-class models on a 2.3 TB box; revisit for models whose mirror doesn't fit | `moe_expert_rows` CSV via `GGML_NUMA_STATS=1` |
 
+| E12 expert sharding (`--numa-mirror dense,kv`) | **implemented**, correctness validated locally; speed verdict needs Pandora. Confirms E11's per-token warning with a number: aggregate per-node balance is ~1.01 and **misleading**, because each MoE op ends at a barrier and runs at its busiest node's pace. Use it for models that don't fit mirrored, not as a speedup | byte-identical output on Qwen1.5-MoE + gemma-4 (fused / `-no-fmoe` / `-no-fug`); footprint 2×7.39 → 2×1.02+6.37 GiB (Qwen), 2×13.4 → 2×3.13+10.25 GiB (gemma-4); `moe_node_skew_mean` TG **1.32** / **1.25**, max **2.00**; PP **1.07** |
+
 ## Experiment log convention
 
 One directory per experiment under `testbed-results/`, plus a row appended to
