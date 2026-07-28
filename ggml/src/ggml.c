@@ -4653,6 +4653,12 @@ static struct {
     uint64_t rows[GGML_NUMA_MOE_MAX_EXPERTS];
     uint64_t ops;
     int      n_expert;
+    // per-op node-imbalance of the owner(e) = e % n_nodes split used by expert sharding.
+    // Cumulative per-node totals average out over a run and hide the real cost: every op ends
+    // at a barrier, so each op is gated by its busiest node. This tracks that per op.
+    uint64_t skew_ops;
+    double   skew_sum; // sum of per-op (max node rows / mean node rows)
+    double   skew_max; // worst single op
 } g_numa_moe_stats;
 
 static void ggml_numa_moe_stats_add(int n_as, const int64_t * counts) {
@@ -4666,6 +4672,31 @@ static void ggml_numa_moe_stats_add(int n_as, const int64_t * counts) {
     for (int a = 0; a < n_as; ++a) {
         g_numa_moe_stats.rows[a] += (uint64_t) counts[a];
     }
+
+    // Work for expert a is proportional to its routed row count, so per-node work is the row
+    // sum over the experts that node owns. Computed whether or not sharding is enabled, so a
+    // plain mirror run can predict what sharding would cost on this model.
+    const int n_nodes = (int) g_state.numa.n_nodes;
+    if (n_nodes > 1) {
+        uint64_t per_node[GGML_NUMA_MAX_NODES] = {0};
+        uint64_t total = 0;
+        for (int a = 0; a < n_as; ++a) {
+            per_node[a % n_nodes] += (uint64_t) counts[a];
+            total                 += (uint64_t) counts[a];
+        }
+        if (total > 0) {
+            uint64_t mx = 0;
+            for (int k = 0; k < n_nodes; ++k) {
+                if (per_node[k] > mx) mx = per_node[k];
+            }
+            const double skew = (double) mx / ((double) total / n_nodes);
+            g_numa_moe_stats.skew_sum += skew;
+            g_numa_moe_stats.skew_ops++;
+            if (skew > g_numa_moe_stats.skew_max) {
+                g_numa_moe_stats.skew_max = skew;
+            }
+        }
+    }
 }
 #endif
 
@@ -4673,7 +4704,8 @@ static void ggml_numa_moe_stats_add(int n_as, const int64_t * counts) {
 struct ggml_numa_stats_node {
     atomic_ullong resolve_hit;      // ggml_numa_tensor_data served this node's mirror copy
     atomic_ullong resolve_fallback; // mirrored tensor lacked this node's copy -> used t->data
-    char pad[GGML_NUMA_BARRIER_LINE - 2*sizeof(atomic_ullong)];
+    atomic_ullong moe_experts;      // expert matmuls this node computed (expert sharding balance)
+    char pad[GGML_NUMA_BARRIER_LINE - 3*sizeof(atomic_ullong)];
 };
 
 static struct {
@@ -5199,6 +5231,60 @@ int ggml_numa_node_for_thread(int ith, int nth) {
     return n - 1;
 }
 
+// Expert-affinity sharding (--numa-mirror dense). Set by llama.cpp once the routed-expert
+// weights have actually been pinned one node each; drives the node-aware MoE scheduling below.
+static bool g_numa_expert_shard = false;
+
+void ggml_numa_set_expert_shard(bool enable) {
+    g_numa_expert_shard = enable;
+}
+
+bool ggml_numa_expert_shard_active(void) {
+    return g_numa_expert_shard;
+}
+
+// Stage 2 of expert-affinity sharding. With --numa-mirror dense, expert e's weights exist only
+// on node e % n_nodes (see llama_numa_shard_expert_tensor), so every other node computing it
+// would be streaming the weights across the interconnect. Returns false when the calling thread
+// should skip this expert entirely; when it returns true it hands back a node-local (ith, nth)
+// so the owning node's threads split the expert's rows among themselves exactly as all nth
+// threads used to split them.
+//
+// Safe to skip because there is no barrier inside the expert loop -- the barrier is before it,
+// and dst is [n_embd, n_expert_used, n_tokens] so each (token, expert) is a disjoint slot and
+// needs no cross-node reduction.
+static inline bool ggml_numa_expert_scope(int cur_a, int ith, int nth, int * e_ith, int * e_nth) {
+    *e_ith = ith;
+    *e_nth = nth;
+    if (!g_numa_expert_shard) {
+        return true;
+    }
+    const int n_nodes = (int) g_state.numa.n_nodes;
+    if (n_nodes < 2) {
+        return true;
+    }
+    const int owner = cur_a % n_nodes;
+    const int node  = ggml_numa_node_for_thread(ith, nth);
+    if (node != owner) {
+        return false;
+    }
+    const int first = ggml_numa_node_first_thread(owner, nth);
+    const int last  = ggml_numa_node_first_thread(owner + 1, nth);
+    if (last <= first) {
+        return true; // node owns no threads: fall back to the global split rather than divide by 0
+    }
+#if defined(__gnu_linux__)
+    if (g_numa_stats_level && ith == first) {
+        // counted once per expert by the node's first thread, so this reads as "experts computed
+        // by this node" -- max/mean across nodes is the routing imbalance the split has to eat
+        atomic_fetch_add_explicit(&g_numa_stats.node[node].moe_experts, 1ULL, memory_order_relaxed);
+    }
+#endif
+    *e_ith = ith - first;
+    *e_nth = last - first;
+    return true;
+}
+
 int ggml_numa_stats_level(void) {
     return g_numa_stats_level;
 }
@@ -5212,9 +5298,23 @@ void ggml_numa_stats_print(void) {
     fprintf(stderr, "numa_stats: nodes=%u fake=%d strategy=%u throttle_gbps=%.1f\n",
             n, g_state.numa.fake ? 1 : 0, g_state.numa.numa_strategy, g_state.numa.throttle_gbps);
     for (uint32_t k = 0; k < n && k < GGML_NUMA_MAX_NODES; ++k) {
-        fprintf(stderr, "numa_stats: node%u resolve_hit=%llu resolve_fallback=%llu\n", k,
+        fprintf(stderr, "numa_stats: node%u resolve_hit=%llu resolve_fallback=%llu moe_experts=%llu\n", k,
                 (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].resolve_hit,      memory_order_relaxed),
-                (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].resolve_fallback, memory_order_relaxed));
+                (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].resolve_fallback, memory_order_relaxed),
+                (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].moe_experts,      memory_order_relaxed));
+    }
+    if (g_numa_expert_shard) {
+        // how lopsided the routing made the per-node expert split: the busier node gates every
+        // token, so this ratio is roughly the throughput left on the table vs a perfect balance
+        uint64_t tot = 0, mx = 0;
+        for (uint32_t k = 0; k < n && k < GGML_NUMA_MAX_NODES; ++k) {
+            const uint64_t v = atomic_load_explicit(&g_numa_stats.node[k].moe_experts, memory_order_relaxed);
+            tot += v;
+            if (v > mx) mx = v;
+        }
+        const double mean = n > 0 ? (double) tot / n : 0.0;
+        fprintf(stderr, "numa_stats: expert_shard=1 moe_experts_total=%llu moe_experts_max=%llu max_over_mean=%.2f\n",
+                (unsigned long long) tot, (unsigned long long) mx, mean > 0 ? (double) mx / mean : 0.0);
     }
     fprintf(stderr, "numa_stats: populate_bytes=%llu populate_calls=%llu populate_us=%llu resync_bytes=%llu resync_calls=%llu\n",
             (unsigned long long) atomic_load_explicit(&g_numa_stats.populate_bytes, memory_order_relaxed),
@@ -5238,6 +5338,16 @@ void ggml_numa_stats_print(void) {
         fprintf(stderr, "numa_stats: moe_ops=%llu n_expert=%d expert_rows_total=%llu expert_rows_max=%llu max_over_mean=%.2f\n",
                 (unsigned long long) g_numa_moe_stats.ops, g_numa_moe_stats.n_expert,
                 (unsigned long long) total, (unsigned long long) mx, mean > 0 ? (double) mx / mean : 0.0);
+        if (g_numa_moe_stats.skew_ops > 0) {
+            // node_skew_mean is the fraction of extra time the average MoE op spends waiting on
+            // its busiest node under owner(e) = e % n_nodes: 1.00 is a perfect split, 2.00 means
+            // one node does everything. This, not the cumulative per-node totals, is the
+            // throughput a shard run gives up to routing imbalance.
+            fprintf(stderr, "numa_stats: moe_node_skew_mean=%.3f moe_node_skew_max=%.3f over %llu ops\n",
+                    g_numa_moe_stats.skew_sum / (double) g_numa_moe_stats.skew_ops,
+                    g_numa_moe_stats.skew_max,
+                    (unsigned long long) g_numa_moe_stats.skew_ops);
+        }
         fprintf(stderr, "numa_stats: moe_expert_rows=");
         for (int a = 0; a < g_numa_moe_stats.n_expert; ++a) {
             fprintf(stderr, "%s%llu", a ? "," : "", (unsigned long long) g_numa_moe_stats.rows[a]);
@@ -19180,6 +19290,13 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
+        // expert-affinity sharding: skip experts owned by another node, and work within a
+        // node-local thread index for the ones we do own (no-op unless --numa-mirror dense)
+        int ith_e, nth_e;
+        if (!ggml_numa_expert_scope(cur_a, ith, nth, &ith_e, &nth_e)) {
+            continue;
+        }
+
         const char * src0_cur = src0_data + cur_a*nb02;
 
         const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
@@ -19194,15 +19311,15 @@ static void ggml_compute_forward_mul_mat_id(
                        src0->type, (const char *)src0_cur, nb01, ///ggml_type_size(src0->type),
                        vec_dot_type, (const char *)wdata, row_size, ///ggml_type_size(vec_dot_type),
                        (float *)dst->data, nb1, nb2,
-                       matrix_rows + cur_a*ne12, ith, nth)) goto IQK_MulMat_Not_Available;
+                       matrix_rows + cur_a*ne12, ith_e, nth_e)) goto IQK_MulMat_Not_Available;
                 continue;
         }
 IQK_MulMat_Not_Available:;
 #endif
 
         if (((ggml_n_dims(src0) - 1) == 2) && gemv) {
-            int64_t src0_cur_start = (ith * ne01) / nth;
-            int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
+            int64_t src0_cur_start = (ith_e * ne01) / nth_e;
+            int64_t src0_cur_end   = ((ith_e + 1) * ne01) / nth_e;
             src0_cur_start = (src0_cur_start % matmul_num_cols) ? src0_cur_start + matmul_num_cols - (src0_cur_start % matmul_num_cols): src0_cur_start;
             src0_cur_end   = (src0_cur_end % matmul_num_cols) ? src0_cur_end + matmul_num_cols - (src0_cur_end % matmul_num_cols): src0_cur_end;
             if (src0_cur_start >= src0_cur_end) return;
@@ -19229,8 +19346,8 @@ IQK_MulMat_Not_Available:;
         }
 
         if (((ggml_n_dims(src0) - 1) == 2) && gemv) {
-            int64_t src0_cur_start = (ith * ne01) / nth;
-            int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
+            int64_t src0_cur_start = (ith_e * ne01) / nth_e;
+            int64_t src0_cur_end   = ((ith_e + 1) * ne01) / nth_e;
             src0_cur_start = (src0_cur_start % matmul_num_cols) ? src0_cur_start + matmul_num_cols - (src0_cur_start % matmul_num_cols): src0_cur_start;
             src0_cur_end   = (src0_cur_end % matmul_num_cols) ? src0_cur_end + matmul_num_cols - (src0_cur_end % matmul_num_cols): src0_cur_end;
             if (src0_cur_start >= src0_cur_end) return;
@@ -19258,11 +19375,11 @@ IQK_MulMat_Not_Available:;
 
         // distribute the thread work across the inner or outer loop based on which one is larger
 
-        const int64_t nth0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        const int64_t nth1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+        const int64_t nth0 = nr0 > nr1 ? nth_e : 1; // parallelize by src0 rows
+        const int64_t nth1 = nr0 > nr1 ? 1 : nth_e; // parallelize by src1 rows
 
-        const int64_t ith0 = ith % nth0;
-        const int64_t ith1 = ith / nth0;
+        const int64_t ith0 = ith_e % nth0;
+        const int64_t ith1 = ith_e / nth0;
 
         const int64_t dr0 = (nr0 + nth0 - 1)/nth0;
         const int64_t dr1 = (nr1 + nth1 - 1)/nth1;
@@ -19472,6 +19589,13 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
             continue;
         }
 
+        // expert-affinity sharding: skip experts owned by another node, and work within a
+        // node-local thread index for the ones we do own (no-op unless --numa-mirror dense)
+        int ith_e, nth_e;
+        if (!ggml_numa_expert_scope(cur_a, ith, nth, &ith_e, &nth_e)) {
+            continue;
+        }
+
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
         if (src0_2) {
             src0_1_cur = src0_1_data + cur_a*nb02;
@@ -19499,7 +19623,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             vec_dot_type, (const char *)wdata, row_size,
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
-                            matrix_rows + cur_a*ne12, limit, ith, nth)) GGML_ABORT("fatal error");
+                            matrix_rows + cur_a*ne12, limit, ith_e, nth_e)) GGML_ABORT("fatal error");
 
     }
 

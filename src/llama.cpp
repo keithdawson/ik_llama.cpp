@@ -7739,6 +7739,12 @@ static void llama_mirror_dense_shard_experts(const llama_model & model, int n_no
         }
     }
 
+    // Tell the MoE kernels to compute expert e only on node e % n_nodes (stage 2). Only once
+    // experts were really pinned -- if the model had none, the graph should stay node-agnostic.
+    if (n_sharded > 0) {
+        ggml_numa_set_expert_shard(true);
+    }
+
     LLAMA_LOG_INFO("%s: NUMA mirror: duplicated %d weight tensors across %d nodes\n",
             __func__, n_mirrored, n_nodes);
     char dist[256];

@@ -40,10 +40,12 @@ has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`
 
 - `--numa mirror` works in every tool that supports `--numa` (`llama-cli`, `llama-server`,
   `llama-bench`, …).
-- `--numa-mirror <list>` selects *what* to mirror: `weights`, `kv`, `all` (default) or
+- `--numa-mirror <list>` selects *what* to mirror: `weights`, `kv`, `dense`, `all` (default) or
   `none` — e.g. `--numa-mirror weights` to mirror only the weights. This component selector is
   available in the main tools (`llama-cli`, `llama-server`, …); `llama-bench` accepts
   `--numa mirror` only and always mirrors everything (`weights` + `kv`).
+- `--numa-mirror dense,kv` is **expert-affinity sharding** for MoE models too large to
+  duplicate — see below.
 - **Requirements:** Linux, more than one NUMA node, and enough RAM to hold the model N times.
   For best results, disable kernel auto-balancing:
   `echo 0 | sudo tee /proc/sys/kernel/numa_balancing`.
@@ -51,6 +53,44 @@ has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`
   physical-core count; it can be worth sweeping `-t` to find the sweet spot for your machine.
 
 See [`examples/main/README.md`](examples/main/README.md) for the full list of `--numa` modes.
+
+### Expert-affinity sharding — `--numa-mirror dense,kv` (MoE models that can't be mirrored)
+
+Mirroring costs `weights × n_nodes`, so a ~1.5 TB MoE needs ~3 TB to mirror on two nodes and
+simply does not fit. `dense` mirrors everything **except** the routed-expert tensors; those keep
+a **single copy**, with expert `e` pinned to node `e % n_nodes`. The footprint becomes
+`dense × n_nodes + experts × 1`. The MoE kernels then compute expert `e` only on that node's
+threads, so the weight reads stay node-local.
+
+```
+# mirror attention/router/embeddings, shard the experts one copy per node
+./build/bin/llama-server -m big-moe.gguf --numa-mirror dense,kv -t <total physical cores> ...
+```
+
+- Output is **bit-identical** to a mirrored or non-NUMA run — sharding changes placement and
+  scheduling, never arithmetic. Each `(token, expert)` writes a disjoint slot, so no cross-node
+  reduction is involved.
+- Shared experts (`*_shexp`) and `ffn_norm_exps` stay mirrored: they are read on every token by
+  every thread. Only `ffn_{up,gate,gate_up,down}_exps` are sharded.
+- Implies `--no-mmap` (as all mirror modes do). It is additionally required here because expert
+  placement uses `mbind(MPOL_MF_MOVE)`, which cannot relocate the page-cache pages behind a
+  file mapping.
+- **Cost — routing imbalance.** Every MoE op ends at a barrier, so it runs at the speed of
+  whichever node drew more of the routed rows. With `GGML_NUMA_STATS=1` the run reports
+  `moe_node_skew_mean` / `moe_node_skew_max`: `1.00` is a perfect split, `2.00` means one node
+  did everything while the other idled. Measured on the fake-NUMA testbed:
+
+  | model | TG (batch 1) | PP (batch 512) |
+  |---|---|---|
+  | Qwen1.5-MoE-A2.7B | `1.32` mean, `2.00` max | `1.07` mean, `1.41` max |
+  | gemma-4-26B-A4B | `1.25` mean, `2.00` max | — |
+
+  So prompt processing averages out, while token generation gives up roughly 25–35% to
+  imbalance. The skew counter is computed whether or not sharding is enabled, so a plain
+  `--numa mirror` run can predict what sharding would cost on a given model before you commit
+  to it. Use `dense` when the model does not fit otherwise, not as a speedup over mirroring.
+- Cumulative per-node totals (`moe_experts=` in the stats) average out to ~1.01 over a run and
+  will look perfectly balanced — they are not the number that matters; `moe_node_skew_mean` is.
 
 ### Hybrid NUMA-GPU Execution (MoE Models)
 

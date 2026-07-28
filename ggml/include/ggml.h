@@ -964,6 +964,11 @@ extern "C" {
     // NUMA mirroring (GGML_NUMA_STRATEGY_MIRROR): duplicate read-mostly data per NUMA node
     GGML_API int      ggml_numa_node_count(void);                  // number of NUMA nodes detected (>=1)
     GGML_API bool     ggml_numa_mirror_active(void);               // true if strategy == MIRROR and >1 node
+    // expert-affinity sharding: set once at load when routed-expert weights were pinned one
+    // node each rather than mirrored, so the MoE kernels know to compute expert e only on the
+    // threads of node e % n_nodes (its weights are node-local only there).
+    GGML_API void     ggml_numa_set_expert_shard(bool enable);
+    GGML_API bool     ggml_numa_expert_shard_active(void);
     GGML_API void     ggml_numa_set_mirror(uint32_t flags);        // which ggml_numa_mirror_flags to mirror
     GGML_API uint32_t ggml_numa_get_mirror(void);                  // current mirror flags
     GGML_API int      ggml_numa_node_for_thread(int ith, int nth); // block split of threads across nodes
