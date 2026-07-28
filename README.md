@@ -92,6 +92,29 @@ threads, so the weight reads stay node-local.
 - Cumulative per-node totals (`moe_experts=` in the stats) average out to ~1.01 over a run and
   will look perfectly balanced — they are not the number that matters; `moe_node_skew_mean` is.
 
+**Rebalancing the skew away — `GGML_NUMA_SHARD_STEAL=1`** (default off, pending on-target
+calibration). Each MoE op re-derives its expert→node assignment from the routing counts every
+thread already has, so an idle node takes work off a busy one instead of waiting at the barrier.
+Because the assignment is a deterministic function of data every thread sees, it needs no
+atomics and no extra barrier, and each expert is still computed in full by one node — so
+**output stays bit-identical**.
+
+Moving an expert off its owner makes its weight reads remote, so a move only pays when the busy
+node sheds more than the idle node takes on. That tradeoff is the `GGML_NUMA_SHARD_STEAL_COST`
+ratio `r`. The algorithm is self-limiting: at high `r` it declines to move at all. Measured on
+the testbed (`skew_after`, remote penalty included):
+
+| `r` | Qwen1.5-MoE | gemma-4-26B |
+|---|---|---|
+| 1.0 | 1.34 → **1.00** | 1.25 → **1.00** |
+| 1.3 | → 1.05 | → 1.04 |
+| 1.5 (default) | → 1.09 | → 1.07 |
+| 2.0 | → 1.24 | → 1.13 |
+
+Set `r` from your own hardware before relying on it — a value set too low over-moves and pays
+more in remote reads than it saves in idle. Get it with the `GGML_NUMA_SHARD_SCHED=0` A/B
+described in that knob's row.
+
 ### Hybrid NUMA-GPU Execution (MoE Models)
 
 For Mixture-of-Experts (MoE) models, you can run a **Hybrid NUMA-GPU** setup where you offload dense layers (like attention and early/late transformations) to your GPU, while leaving the massive MoE experts to run across all of your CPU's NUMA nodes using the `--numa mirror` strategy.
@@ -125,6 +148,8 @@ their defaults) plus the tooling to pick their values for a specific machine:
 | `GGML_NUMA_COPY_MIN_MB` | 64 | below this size a single memcpy is used |
 | `GGML_NUMA_NT_COPY` | off | `1` = non-temporal (streaming) stores for the explicit cross-node copies |
 | `GGML_NUMA_HUGETLB` | off | `1` = back mirror allocations with explicit 2 MiB hugetlb pages (needs `vm.nr_hugepages`; falls back to THP) |
+| `GGML_NUMA_SHARD_STEAL` | off | with `--numa-mirror dense`, `1` rebalances each MoE op's experts across nodes when routing lands lopsided (see below). Output stays bit-identical |
+| `GGML_NUMA_SHARD_STEAL_COST` | 1.5 | the remote-read penalty ratio `r` used by that rebalancer: how much slower an expert is when computed off its owner node. Measure it with `GGML_NUMA_SHARD_SCHED=0` before trusting the default |
 | `GGML_NUMA_SHARD_SCHED` | 1 | with `--numa-mirror dense`, `0` keeps expert placement but restores the old schedule (every node computes every expert, ~half the reads remote). Measurement only: paired against `--numa mirror` it isolates the remote-read penalty on your hardware |
 | `GGML_NUMA_STATS` | off | `1` = dump mirror-path counters at exit (incl. a per-expert MoE routing census and `moe_node_skew_*`); `2` = also per `llama_print_timings` |
 | `GGML_NUMA_FAKE` | unset | testbed only: fabricate N NUMA nodes on a 1-node box (see `docs/numa-testbed.md`) |

@@ -4660,6 +4660,9 @@ static struct {
     uint64_t skew_ops;
     double   skew_sum; // sum of per-op (max node rows / mean node rows)
     double   skew_max; // worst single op
+    uint64_t moves;    // experts relocated off their owner node by the rebalancer
+    uint64_t after_ops; // ops the rebalancer scored
+    double   after_sum; // sum of per-op post-assignment skew (remote penalty included)
 } g_numa_moe_stats;
 
 static void ggml_numa_moe_stats_add(int n_as, const int64_t * counts) {
@@ -4700,6 +4703,116 @@ static void ggml_numa_moe_stats_add(int n_as, const int64_t * counts) {
     }
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Cost-aware expert -> node assignment (stage 2b: rebalancing).
+//
+// owner(e) = e % n_nodes is perfectly local but not balanced: with GLM-5.2's top-8 of 256,
+// a token's active experts land 5/3 or worse across two nodes about as often as 4/4, and the
+// op cannot finish until the heavier node does. Measured mean skew 1.25-1.32.
+//
+// Rather than steal opportunistically (which needs atomics and makes the row split
+// nondeterministic), every thread derives the SAME assignment from matrix_row_counts, which is
+// already filled by ith==0 and published by the barrier before the expert loop. Deterministic
+// in, deterministic out: each expert is still computed in full by one node's threads, so output
+// stays bit-identical -- only which node does it can change.
+//
+// Moving expert e off its owner makes its weight reads remote, so a move only pays when the
+// heavier node sheds more than the lighter node takes on. steal_cost is that penalty ratio r
+// (GGML_NUMA_SHARD_STEAL_COST); at r >= 2 a one-expert move from a 5/3 split is already
+// break-even, which is why the default is conservative and the knob is off until measured.
+// ---------------------------------------------------------------------------
+#define GGML_NUMA_MOE_MAX_ASSIGN 1024
+static int    g_numa_expert_node[GGML_NUMA_MOE_MAX_ASSIGN]; // written by ith==0, read after the barrier
+static int    g_numa_expert_assigned = 0;                   // n_as the table is valid for (0 = use owner())
+static int    g_numa_shard_steal = 0;                       // GGML_NUMA_SHARD_STEAL
+static double g_numa_steal_cost  = 1.5;                     // GGML_NUMA_SHARD_STEAL_COST
+
+static inline double ggml_numa_expert_cost(int a, int node, int n_nodes, const int64_t * counts) {
+    const double w = (double) counts[a];
+    return (a % n_nodes) == node ? w : w * g_numa_steal_cost;
+}
+
+// Called by ith==0 only, before the barrier that publishes matrix_row_counts.
+static void ggml_numa_moe_assign(int n_as, const int64_t * counts, int n_nodes) {
+    g_numa_expert_assigned = 0;
+    if (!g_numa_shard_steal || n_nodes < 2 || n_as > GGML_NUMA_MOE_MAX_ASSIGN) {
+        return; // fall back to the pure owner() rule
+    }
+
+    double load[GGML_NUMA_MAX_NODES] = {0};
+    int    active[GGML_NUMA_MOE_MAX_ASSIGN];
+    int    n_active = 0;
+    for (int a = 0; a < n_as; ++a) {
+        const int owner = a % n_nodes;
+        g_numa_expert_node[a] = owner;
+        if (counts[a] > 0) {
+            load[owner] += (double) counts[a];
+            active[n_active++] = a;
+        }
+    }
+    g_numa_expert_assigned = n_as;
+    if (n_active <= 1) {
+        return;
+    }
+
+    // Greedy: while some expert can be moved off the heaviest node such that the predicted
+    // makespan max(load) strictly drops, move the best one. Bounded by n_active moves, and in
+    // practice ends after one or two -- at top-8 there is not much to fix.
+    for (int iter = 0; iter < n_active; ++iter) {
+        int hi = 0, lo = 0;
+        for (int k = 1; k < n_nodes; ++k) {
+            if (load[k] > load[hi]) hi = k;
+            if (load[k] < load[lo]) lo = k;
+        }
+        if (hi == lo) {
+            break;
+        }
+        int    best     = -1;
+        double best_max = load[hi]; // must strictly improve on doing nothing
+        for (int i = 0; i < n_active; ++i) {
+            const int a = active[i];
+            if (g_numa_expert_node[a] != hi) {
+                continue;
+            }
+            const double shed = ggml_numa_expert_cost(a, hi, n_nodes, counts);
+            const double take = ggml_numa_expert_cost(a, lo, n_nodes, counts);
+            const double nh   = load[hi] - shed;
+            const double nl   = load[lo] + take;
+            const double mx   = nh > nl ? nh : nl;
+            if (mx < best_max - 1e-9) {
+                best_max = mx;
+                best     = a;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        load[hi] -= ggml_numa_expert_cost(best, hi, n_nodes, counts);
+        load[lo] += ggml_numa_expert_cost(best, lo, n_nodes, counts);
+        g_numa_expert_node[best] = lo;
+#if defined(__gnu_linux__)
+        g_numa_moe_stats.moves++; // ith==0 only, ops run sequentially -- same safety as the census
+#endif
+    }
+
+#if defined(__gnu_linux__)
+    // Residual imbalance the op will actually run at, remote penalties included. Paired with
+    // moe_node_skew_mean (which always scores the untouched owner() split) this reads as
+    // before -> after, so the rebalancer's effect is visible rather than inferred.
+    if (g_numa_stats_level) {
+        double tot = 0.0, mx = 0.0;
+        for (int k = 0; k < n_nodes; ++k) {
+            tot += load[k];
+            if (load[k] > mx) mx = load[k];
+        }
+        if (tot > 0.0) {
+            g_numa_moe_stats.after_sum += mx / (tot / n_nodes);
+            g_numa_moe_stats.after_ops++;
+        }
+    }
+#endif
+}
 
 #if defined(__gnu_linux__)
 struct ggml_numa_stats_node {
@@ -5070,6 +5183,21 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
             g_numa_nt_copy = true;
             GGML_PRINT("%s: non-temporal stores enabled for cross-node copies (GGML_NUMA_NT_COPY)\n", __func__);
         }
+        s = getenv("GGML_NUMA_SHARD_STEAL");
+        if (s && *s && strcmp(s, "0") != 0) {
+            g_numa_shard_steal = 1;
+            GGML_PRINT("%s: MoE expert rebalancing enabled (GGML_NUMA_SHARD_STEAL)\n", __func__);
+        }
+        s = getenv("GGML_NUMA_SHARD_STEAL_COST");
+        if (s && *s) {
+            double v = atof(s);
+            if (v >= 1.0) {
+                g_numa_steal_cost = v;
+                GGML_PRINT("%s: remote-expert cost ratio = %.2f (GGML_NUMA_SHARD_STEAL_COST)\n", __func__, v);
+            } else {
+                fprintf(stderr, "%s: ignoring GGML_NUMA_SHARD_STEAL_COST=%s (want >= 1.0)\n", __func__, s);
+            }
+        }
         s = getenv("GGML_NUMA_SHARD_SCHED");
         if (s && *s && strcmp(s, "0") == 0) {
             g_numa_shard_sched = 0;
@@ -5275,7 +5403,8 @@ static inline bool ggml_numa_expert_scope(int cur_a, int ith, int nth, int * e_i
     if (n_nodes < 2) {
         return true;
     }
-    const int owner = cur_a % n_nodes;
+    // the rebalancer may have moved this expert off its owner; every thread reads the same table
+    const int owner = (g_numa_expert_assigned > cur_a) ? g_numa_expert_node[cur_a] : (cur_a % n_nodes);
     const int node  = ggml_numa_node_for_thread(ith, nth);
     if (node != owner) {
         return false;
@@ -5359,6 +5488,16 @@ void ggml_numa_stats_print(void) {
                     g_numa_moe_stats.skew_sum / (double) g_numa_moe_stats.skew_ops,
                     g_numa_moe_stats.skew_max,
                     (unsigned long long) g_numa_moe_stats.skew_ops);
+            // NB: skew above is always measured against the owner() split, so it stays comparable
+            // across runs and shows the imbalance the rebalancer was asked to remove.
+            if (g_numa_shard_steal && g_numa_moe_stats.after_ops > 0) {
+                fprintf(stderr, "numa_stats: moe_rebalance=1 cost=%.2f moves=%llu (%.2f per op) "
+                        "skew_after=%.3f (from %.3f)\n",
+                        g_numa_steal_cost, (unsigned long long) g_numa_moe_stats.moves,
+                        (double) g_numa_moe_stats.moves / (double) g_numa_moe_stats.skew_ops,
+                        g_numa_moe_stats.after_sum / (double) g_numa_moe_stats.after_ops,
+                        g_numa_moe_stats.skew_sum  / (double) g_numa_moe_stats.skew_ops);
+            }
         }
         fprintf(stderr, "numa_stats: moe_expert_rows=");
         for (int a = 0; a < g_numa_moe_stats.n_expert; ++a) {
@@ -19290,6 +19429,9 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_numa_moe_stats_add(n_as, matrix_row_counts); // expert-routing census (E11)
         }
 #endif
+        // expert -> node assignment for this op, published by the barrier below along with
+        // matrix_row_counts. No-op unless expert sharding + rebalancing are both on.
+        ggml_numa_moe_assign(n_as, matrix_row_counts, ggml_numa_node_count());
     }
 
     ggml_barrier(params->shared);
@@ -19585,6 +19727,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
             ggml_numa_moe_stats_add(n_as, matrix_row_counts); // expert-routing census (E11)
         }
 #endif
+        // expert -> node assignment for this op, published by the barrier below along with
+        // matrix_row_counts. No-op unless expert sharding + rebalancing are both on.
+        ggml_numa_moe_assign(n_as, matrix_row_counts, ggml_numa_node_count());
     }
 
     ggml_barrier(params->shared);

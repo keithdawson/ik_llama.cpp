@@ -96,6 +96,31 @@ Recommended order and where each answer goes:
 `all` runs 1–5 (plus 7–8 when hybrid flags are passed). Lists are overridable via env
 (`GATE_LIST`, `COPY_THREADS_LIST`, `NT_LIST`, `THREADS_LIST`, `RESERVE_LIST`).
 
+### Measured on Pandora — GLM 5.2, 2× EPYC 9665 (2026-07)
+
+Results from the real machine, as opposed to the fake-NUMA testbed. These are the values to
+start from; re-derive only if the hardware or model changes.
+
+| knob | result | notes |
+|---|---|---|
+| `threads` | **`-t 128`** | coarse sweep 96 / 128 / 144 / …; 128 won. Below the 192 physical cores, as expected for bandwidth-bound TG — do not assume "all cores" |
+| `spincount` | **5000** | coarse matrix; **2500 and 10000 were both significantly worse**, so the optimum is fairly sharp. This is now the built-in default (was 25000, which was the 8-core testbed optimum). A denser sweep around 5000 was started but not finished |
+| `census` expert skew | **1.74** `max_over_mean` | per-expert routing skew for GLM 5.2. Comfortably shard-friendly (>>3 would mean a few hot experts dominate). Sits next to gemma-4's 1.78, which measured a *node* skew of ~1.25 |
+| `numactl` / `GGML_NUMA_RESERVE_CPUS` | not exercised | untouched so far; the reserve knob is hybrid-only insurance |
+| CUDA on the server | **resolved** | the long-standing `ggml_cuda_init: failed to initialize CUDA` with no reason string turned out to be a **Resizable BAR misconfiguration**, not a driver or library problem. Check ReBAR/above-4G-decoding in firmware before chasing `libcuda` stubs or `nvidia_uvm` |
+
+Not yet measured, and it gates the expert rebalancer (`GGML_NUMA_SHARD_STEAL`): the
+**remote-read penalty `r`** — how much slower an expert matmul is when its weights sit on the
+other socket. Get it with three runs at identical model/threads/prompt:
+
+```sh
+A: --numa mirror                                     # all local, balanced
+B: --numa-mirror dense,kv  GGML_NUMA_SHARD_SCHED=0   # same schedule, ~half remote  -> r = B/A
+C: --numa-mirror dense,kv                            # node-aware, local, imbalanced
+```
+
+Then set `GGML_NUMA_SHARD_STEAL_COST` to the measured `r` before enabling the rebalancer.
+
 ### Sizing notes for a ~500 GB model (GLM 5.2 Q5_K_XL, 700B/A40B)
 
 - **Mirror fits**: 2 × 500 GB ≈ 1 TB of the 2.3 TB. The free-RAM check needs

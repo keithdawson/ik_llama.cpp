@@ -123,11 +123,39 @@ side had none of these.
 
 ---
 
-## 3. NEXT: stage 3 — tensor-parallel expert split
+## 2b. DONE: cost-aware expert rebalancing (`GGML_NUMA_SHARD_STEAL`, default off)
 
-The measured 1.25-1.32 TG skew is inherent to owner-per-expert scheduling. The fix that removes
-it entirely: split **each** expert across nodes instead of assigning whole experts, so every
-node does an equal share of every expert.
+The "work stealing" idea, built as **deterministic rebalancing** rather than opportunistic
+stealing. Each MoE op re-derives its expert→node assignment from `matrix_row_counts`, which
+`ith==0` already fills and the pre-loop barrier already publishes. Because every thread runs the
+same greedy pass over the same data, they agree without atomics or an extra barrier, each expert
+is still computed in full by one node, and **output stays bit-identical** — which opportunistic
+stealing would have cost us.
+
+Moving an expert off its owner makes its reads remote, so a move only pays when the busy node
+sheds more than the idle node takes on. That ratio is `GGML_NUMA_SHARD_STEAL_COST` (`r`,
+default 1.5). The algorithm is self-limiting — at high `r` it simply declines to move:
+
+| `r` | Qwen1.5-MoE | gemma-4-26B |
+|---|---|---|
+| 1.0 | 1.34 → **1.00** | 1.25 → **1.00** |
+| 1.3 | → 1.05 | → 1.04 |
+| 1.5 | → 1.09 | → 1.07 |
+| 2.0 | → 1.24 (few moves) | → 1.13 |
+
+Stats print `moe_rebalance=1 cost=… moves=… skew_after=… (from …)`. Note `moe_node_skew_mean`
+always scores the *untouched* `owner()` split so before/after stay comparable.
+
+**Default off pending the `r` measurement** — per this repo's convention for unvalidated knobs.
+An `r` set too low over-moves and pays more in remote reads than it saves in idle.
+
+---
+
+## 3. LATER: stage 3 — tensor-parallel expert split
+
+Only worth it if rebalancing leaves too much on the table. It removes the remaining skew
+entirely, at the cost of giving up bit-identity: split **each** expert across nodes instead of
+assigning whole experts, so every node does an equal share of every expert.
 
 - `ffn_up` / `ffn_gate`: split by **output rows**. Each node computes its own row block from
   local weights. No communication.
@@ -161,12 +189,17 @@ no-op and cannot show the remote-read cost being traded.
 
 ## 4. Open items / unfinished
 
-- **Finer `GOMP_SPINCOUNT` sweep** around 5000 — started on the server, unfinished.
-  `SPINS="2500 4000 5000 6000 7500" ./scripts/tune-spincount.sh …`
-- **Server CUDA init unresolved.** `ggml_cuda_init: failed to initialize CUDA`, no reason
-  string, on bare metal. Next step `scripts/cuda-probe.cu`; interpretation table in
-  `SERVE-GLM-NOTES.md`. Suspects: stub `libcuda.so` on `LD_LIBRARY_PATH`, driver↔library
-  mismatch (reboot), nvidia_uvm.
+- **Finer `GOMP_SPINCOUNT` sweep** around 5000 — the coarse matrix confirmed **5000** (both
+  2500 and 10000 were significantly worse, so the optimum is sharp); a denser sweep was started
+  on the server but not finished.
+  `SPINS="4000 4500 5000 5500 6000" ./scripts/tune-spincount.sh …`
+- **Remote-read penalty `r` unmeasured** — needed to set `GGML_NUMA_SHARD_STEAL_COST` and to
+  justify enabling the rebalancer at all. Procedure in `docs/numa-tuning.md`
+  ("Measured on Pandora"). Until then `GGML_NUMA_SHARD_STEAL` stays default-off.
+- ~~Server CUDA init~~ **RESOLVED**: it was a **Resizable BAR** misconfiguration, not a driver
+  or library problem. CUDA works on the server now. Worth remembering that the symptom was
+  `ggml_cuda_init: failed to initialize CUDA` with *no reason string* while `nvidia-smi` was
+  perfectly happy — check ReBAR / above-4G decoding before chasing `libcuda` stubs.
 - **MTP not confirmed** — retest with `llama-server` (`llama-cli` ignores `--spec-type`),
   requires `-np 1`.
 - GLM serving works CPU-only with `--jinja` at ~12.3 t/s. Always pass an explicit `-c`.
