@@ -232,10 +232,15 @@ no-op and cannot show the remote-read cost being traded.
 
 ## 4. Open items / unfinished
 
-- **Finer `GOMP_SPINCOUNT` sweep** around 5000 — the coarse matrix confirmed **5000** (both
-  2500 and 10000 were significantly worse, so the optimum is sharp); a denser sweep was started
-  on the server but not finished.
-  `SPINS="4000 4500 5000 5500 6000" ./scripts/tune-spincount.sh …`
+- **`GOMP_SPINCOUNT` sweep in flight (2026-07-30).** Coarse matrix gave 5000 (2500/10000 clearly
+  worse); a finer sweep then gave **8000**; an even finer one is running. **Provisional** — 7500
+  was in the original list and lost to 5000, so 5000/7500/8000 may all be inside run-to-run
+  noise. `tune-spincount.sh` now reports the per-point tg spread for exactly this reason; re-run
+  the shortlist with `-r 7` before adopting.
+  The built-in auto-default is still **5000**; flip it in `common/common.cpp` (~line 4086, and
+  the log string beside it) once the value settles. No rebuild needed to use a different value —
+  set **both** `OMP_WAIT_POLICY=PASSIVE` and `GOMP_SPINCOUNT=<n>` in the serving env, since
+  setting either alone disables the auto-default block entirely.
 - **Remote-read penalty `r` unmeasured** — needed to set `GGML_NUMA_SHARD_STEAL_COST` and to
   justify enabling the rebalancer at all. Procedure in `docs/numa-tuning.md`
   ("Measured on Pandora"). Until then `GGML_NUMA_SHARD_STEAL` stays default-off.

@@ -73,23 +73,36 @@ echo "spincount sweep: $SPINS  (reps=$REPS, bin=$BIN)"
 echo "warmup..." >&2
 run_once 5000 > /dev/null
 
-printf '%-10s %12s %12s\n' "spincount" "pp t/s" "tg t/s"
-best_spin=""; best_tg=0
+printf '%-10s %12s %12s %12s\n' "spincount" "pp t/s" "tg t/s" "tg spread"
+best_spin=""; best_tg=0; best_spread=0; worst_spread=0
 for s in $SPINS; do
-    pp_sum=0; tg_sum=0
+    pp_sum=0; tg_sum=0; tg_min=""; tg_max=""
     for r in $(seq 1 "$REPS"); do
         read -r pp tg < <(run_once "$s")
         pp_sum=$(awk "BEGIN{print $pp_sum+$pp}")
         tg_sum=$(awk "BEGIN{print $tg_sum+$tg}")
+        [ -z "$tg_min" ] && tg_min=$tg && tg_max=$tg
+        awk "BEGIN{exit !($tg < $tg_min)}" && tg_min=$tg
+        awk "BEGIN{exit !($tg > $tg_max)}" && tg_max=$tg
     done
     pp_avg=$(awk "BEGIN{printf \"%.1f\", $pp_sum/$REPS}")
     tg_avg=$(awk "BEGIN{printf \"%.2f\", $tg_sum/$REPS}")
-    printf '%-10s %12s %12s\n' "$s" "$pp_avg" "$tg_avg"
-    if awk "BEGIN{exit !($tg_avg > $best_tg)}"; then best_tg=$tg_avg; best_spin=$s; fi
+    # spread across reps at this point: the yardstick for whether a "win" is real
+    spread=$(awk "BEGIN{printf \"%.2f\", $tg_max-$tg_min}")
+    printf '%-10s %12s %12s %12s\n' "$s" "$pp_avg" "$tg_avg" "+-$spread"
+    awk "BEGIN{exit !($spread > $worst_spread)}" && worst_spread=$spread
+    if awk "BEGIN{exit !($tg_avg > $best_tg)}"; then best_tg=$tg_avg; best_spin=$s; best_spread=$spread; fi
 done
 
 echo
-echo "best tg: GOMP_SPINCOUNT=$best_spin ($best_tg t/s)"
+echo "best tg: GOMP_SPINCOUNT=$best_spin ($best_tg t/s, spread +-$best_spread over $REPS reps)"
+# A mean that wins by less than the run-to-run spread is not a result. This sweep has a broad
+# optimum, so it is easy to "discover" a new best value that is really just noise -- 5000, 7500
+# and 8000 have each won a run on the same machine.
+echo "-> any value whose mean is within +-$worst_spread of that is NOT distinguishable at reps=$REPS;"
+echo "   re-run the shortlist with -r 7 (or more) before believing a difference that small."
 echo "-> if pp at that value is also within noise of the best pp row, adopt it:"
 echo "   export OMP_WAIT_POLICY=PASSIVE GOMP_SPINCOUNT=$best_spin"
+echo "   BOTH variables: setting either one alone disables the built-in auto-default entirely,"
+echo "   so GOMP_SPINCOUNT without OMP_WAIT_POLICY=PASSIVE will not reproduce this measurement."
 echo "   (see docs/numa-tuning.md 'Waiting policy' for where to persist this)"

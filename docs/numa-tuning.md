@@ -46,6 +46,16 @@ when there are ~190 of them). Re-tune per machine:
 The script sweeps `GOMP_SPINCOUNT` over {0, 1k, 2.5k, 5k, 7.5k, 10k, 25k, 100k} against
 a ~3k-token prompt and prints a pp/tg table plus the best value (override with `SPINS=`).
 
+It also prints the **tg spread across reps** at each point, because the optimum here is broad
+and it is easy to "discover" a new best that is really noise — 5000, 7500 and 8000 have each
+won a run on the same machine. A mean that wins by less than the spread is not a result;
+re-run the shortlist with `-r 7` before acting on it.
+
+**Set both variables, not just the spin count.** The binary's auto-default fires only when
+*neither* `OMP_WAIT_POLICY` nor `GOMP_SPINCOUNT` is present, so setting `GOMP_SPINCOUNT` alone
+suppresses `OMP_WAIT_POLICY=PASSIVE` too — and the sweep measured every point *under* PASSIVE.
+Setting only the spin count will not reproduce the tuned number.
+
 **What to do with the answer:** pick the spin count with the best tg whose pp is also
 within noise of the best pp row (they usually agree; if not, favor tg for a serving
 box). If it's 5000, do nothing — the built-in default already matches. If it differs,
@@ -232,7 +242,7 @@ start from; re-derive only if the hardware or model changes.
 | knob | result | notes |
 |---|---|---|
 | `threads` | **`-t 128`** | coarse sweep 96 / 128 / 144 / …; 128 won. Below the 192 physical cores, as expected for bandwidth-bound TG — do not assume "all cores" |
-| `spincount` | **5000** | coarse matrix; **2500 and 10000 were both significantly worse**, so the optimum is fairly sharp. This is now the built-in default (was 25000, which was the 8-core testbed optimum). A denser sweep around 5000 was started but not finished |
+| `spincount` | **8000 (provisional)** | coarse matrix first gave 5000, with 2500 and 10000 clearly worse. A finer sweep then put the peak at **8000**; an even finer one is in flight (2026-07-30). Treat as provisional: 7500 was in the *original* list and lost to 5000, so 5000/7500/8000 may all sit inside run-to-run noise. `tune-spincount.sh` now prints the per-point tg spread so a "win" can be checked against it — re-run the shortlist with `-r 7`. The built-in auto-default is still 5000 (was 25000, the 8-core testbed optimum); override in the serving env rather than rebuilding |
 | `census` expert skew | **1.74** `max_over_mean` | per-expert routing skew for GLM 5.2. Comfortably shard-friendly (>>3 would mean a few hot experts dominate). Sits next to gemma-4's 1.78, which measured a *node* skew of ~1.25 |
 | `numactl` / `GGML_NUMA_RESERVE_CPUS` | not exercised | untouched so far; the reserve knob is hybrid-only insurance |
 | CUDA on the server | **resolved** | the long-standing `ggml_cuda_init: failed to initialize CUDA` with no reason string turned out to be a **Resizable BAR misconfiguration**, not a driver or library problem. Check ReBAR/above-4G-decoding in firmware before chasing `libcuda` stubs or `nvidia_uvm` |
