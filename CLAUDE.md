@@ -63,10 +63,12 @@ bit-identical). Measure the remote-read penalty `r` first with
 ## Server quickstart (airgapped)
 
 ```sh
-# 0. first session only: restore exec bits (zip drops them) and clear any build
-#    directory that rode along in the package (Windows .exe artifacts are useless here)
-chmod +x scripts/*.sh
+# 0. first session only: clear any build directory that rode along in the package
+#    (Windows .exe artifacts are useless here). Exec bits on our scripts are committed
+#    as 100755 now, so chmod is only needed if the transfer medium stripped them
+#    (a plain .zip of the working folder does; the tar.gz carry archive does not).
 rm -rf build
+chmod +x scripts/*.sh scripts/testbed/*.sh 2>/dev/null || true   # harmless belt-and-braces
 
 # 1. build (CPU; add -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="89;120" for the Ada/Blackwells)
 ./scripts/build-zen.sh
