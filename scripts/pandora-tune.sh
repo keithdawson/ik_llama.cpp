@@ -10,6 +10,8 @@
 #
 # Subcommands (CPU-only unless marked hybrid):
 #   census        one instrumented run: expert-routing histogram + mirror sanity checks
+#   shard         MoE too big to mirror: measures the remote-read penalty r and prints the
+#                 GGML_NUMA_SHARD_STEAL_COST to use (skip if the model fits mirrored)
 #   spincount     GOMP_SPINCOUNT sweep (hybrid; wraps scripts/tune-spincount.sh)
 #   barrier-gate  GGML_NUMA_HIER_BATCH_MAX sweep      (tg + pp)
 #   copy          GGML_NUMA_COPY_THREADS x NT_COPY    (mirror populate GB/s)
@@ -269,8 +271,49 @@ sub_verify() {
     echo "  numastat -p \$(pgrep llama-server)   # both nodes should hold ~= the model size"
 }
 
+sub_shard() {
+    echo "== shard: expert sharding, and the remote-read penalty r =="
+    echo "Only for MoE models too large to mirror. Three runs, identical model/threads/prompt:"
+    echo "  A and B run the SAME schedule and differ only in locality, which is what isolates r."
+    echo
+
+    local a_pp a_tg b_pp b_tg c_pp c_tg
+    read -r a_pp a_tg < <(run_bench "" --numa mirror)
+    echo "  A  mirror .............................. pp=$a_pp  tg=$a_tg   (all local, balanced)"
+    read -r b_pp b_tg < <(run_bench "GGML_NUMA_SHARD_SCHED=0" --numa-mirror dense,kv)
+    echo "  B  dense-shard, node-aware sched OFF ... pp=$b_pp  tg=$b_tg   (~half the expert reads remote)"
+    read -r c_pp c_tg < <(run_bench "" --numa-mirror dense,kv)
+    echo "  C  dense-shard, node-aware sched ON .... pp=$c_pp  tg=$c_tg   (local again, but imbalanced)"
+    echo
+
+    # In B every node still computes every expert, so roughly half the expert bytes come from
+    # the other socket: tg_B ~= tg_A / (0.5 + 0.5r)  ->  r ~= 2*(tg_A/tg_B) - 1. First-order,
+    # and it assumes TG time is dominated by expert weight streaming (true for a large MoE).
+    local r ca
+    r=$(awk "BEGIN{ if ($b_tg > 0) { v = 2*($a_tg/$b_tg) - 1; if (v < 1) v = 1; printf \"%.2f\", v } else print \"0\" }")
+    ca=$(awk "BEGIN{ if ($a_tg > 0) printf \"%.2f\", $c_tg/$a_tg; else print \"0\" }")
+
+    echo "-- instrumented sharded run (routing imbalance) --"
+    GGML_NUMA_STATS=1 "$BIN" -m "$MODEL" -t "$THREADS" "${EXTRA[@]}" --numa-mirror dense,kv \
+        -c 4096 -n 32 --temp 0 --seed 1 --no-display-prompt -f "$PROMPT" 2>&1 |
+        grep -aE 'NUMA shard:|moe_node_skew|expert_shard=' || true
+    echo
+    echo "==> RESULT shard:"
+    echo "  - remote-read penalty  r ~= $r    -> export GGML_NUMA_SHARD_STEAL_COST=$r"
+    echo "    (A/B ratio $(awk "BEGIN{if ($b_tg>0) printf \"%.3f\", $a_tg/$b_tg; else print 0}"); r is clamped to >= 1.00)"
+    echo "  - sharded vs mirrored  C/A = $ca"
+    echo "      C/A < 1 is EXPECTED: sharding is how you FIT a model that cannot be mirrored,"
+    echo "      not a way to go faster. If the model fits mirrored, keep --numa mirror."
+    echo "  - if r >= 2.00 the rebalancer will decline to move experts (a move cannot pay for"
+    echo "    itself at that ratio); leave GGML_NUMA_SHARD_STEAL off and accept the skew."
+    echo "  - otherwise enable it and re-run to confirm moe_skew_after drops:"
+    echo "      GGML_NUMA_SHARD_STEAL=1 GGML_NUMA_SHARD_STEAL_COST=$r"
+    echo "  - full explanation: docs/numa-tuning.md, 'Expert sharding and rebalancing'"
+}
+
 case $CMD in
     census)       sub_census ;;
+    shard)        sub_shard ;;
     spincount)    exec "$SCRIPT_DIR/tune-spincount.sh" -b "$BIN" -m "$MODEL" -t "$THREADS" -r "$REPS" -n "$NPRED" -- "${EXTRA[@]}" ;;
     barrier-gate) sub_barrier_gate ;;
     copy)         sub_copy ;;

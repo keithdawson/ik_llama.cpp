@@ -4728,26 +4728,42 @@ static int    g_numa_expert_assigned = 0;                   // n_as the table is
 static int    g_numa_shard_steal = 0;                       // GGML_NUMA_SHARD_STEAL
 static double g_numa_steal_cost  = 1.5;                     // GGML_NUMA_SHARD_STEAL_COST
 
+static int ggml_numa_node_first_thread(int k, int nth); // defined below, with the pinning code
+
+// Rows expert a adds to node's queue: its own rows, inflated by the remote penalty when node is
+// not a's owner (its weights live on the owner, so anyone else streams them across the link).
 static inline double ggml_numa_expert_cost(int a, int node, int n_nodes, const int64_t * counts) {
     const double w = (double) counts[a];
     return (a % n_nodes) == node ? w : w * g_numa_steal_cost;
 }
 
 // Called by ith==0 only, before the barrier that publishes matrix_row_counts.
-static void ggml_numa_moe_assign(int n_as, const int64_t * counts, int n_nodes) {
+//
+// Works in *time* units, not row counts: a node's finishing time is its queued rows divided by
+// how many threads it has. That only matters when nodes are asymmetric -- after
+// GGML_NUMA_RESERVE_CPUS, or on a topology with uneven CPUs per node -- where equal rows are not
+// equal time and comparing raw rows would move work onto the node least able to absorb it. With
+// symmetric nodes every term scales by the same constant and this is identical to comparing rows.
+static void ggml_numa_moe_assign(int n_as, const int64_t * counts, int n_nodes, int nth) {
     g_numa_expert_assigned = 0;
     if (!g_numa_shard_steal || n_nodes < 2 || n_as > GGML_NUMA_MOE_MAX_ASSIGN) {
         return; // fall back to the pure owner() rule
     }
 
-    double load[GGML_NUMA_MAX_NODES] = {0};
+    double rows[GGML_NUMA_MAX_NODES] = {0};
+    double cap [GGML_NUMA_MAX_NODES];
     int    active[GGML_NUMA_MOE_MAX_ASSIGN];
     int    n_active = 0;
+    for (int k = 0; k < n_nodes; ++k) {
+        const int lo_t = ggml_numa_node_first_thread(k,     nth);
+        const int hi_t = ggml_numa_node_first_thread(k + 1, nth);
+        cap[k] = (double) (hi_t > lo_t ? hi_t - lo_t : 1); // a node with no threads of its own
+    }                                                     // never wins the "lightest" slot anyway
     for (int a = 0; a < n_as; ++a) {
         const int owner = a % n_nodes;
         g_numa_expert_node[a] = owner;
         if (counts[a] > 0) {
-            load[owner] += (double) counts[a];
+            rows[owner] += (double) counts[a];
             active[n_active++] = a;
         }
     }
@@ -4756,30 +4772,28 @@ static void ggml_numa_moe_assign(int n_as, const int64_t * counts, int n_nodes) 
         return;
     }
 
-    // Greedy: while some expert can be moved off the heaviest node such that the predicted
-    // makespan max(load) strictly drops, move the best one. Bounded by n_active moves, and in
-    // practice ends after one or two -- at top-8 there is not much to fix.
+    // Greedy: while some expert can be moved off the slowest-finishing node such that the
+    // predicted makespan max(rows/cap) strictly drops, move the best one. Bounded by n_active
+    // moves and in practice ends after one or two -- at top-8 there is not much to fix.
     for (int iter = 0; iter < n_active; ++iter) {
         int hi = 0, lo = 0;
         for (int k = 1; k < n_nodes; ++k) {
-            if (load[k] > load[hi]) hi = k;
-            if (load[k] < load[lo]) lo = k;
+            if (rows[k]/cap[k] > rows[hi]/cap[hi]) hi = k;
+            if (rows[k]/cap[k] < rows[lo]/cap[lo]) lo = k;
         }
         if (hi == lo) {
             break;
         }
         int    best     = -1;
-        double best_max = load[hi]; // must strictly improve on doing nothing
+        double best_max = rows[hi]/cap[hi]; // must strictly improve on doing nothing
         for (int i = 0; i < n_active; ++i) {
             const int a = active[i];
             if (g_numa_expert_node[a] != hi) {
                 continue;
             }
-            const double shed = ggml_numa_expert_cost(a, hi, n_nodes, counts);
-            const double take = ggml_numa_expert_cost(a, lo, n_nodes, counts);
-            const double nh   = load[hi] - shed;
-            const double nl   = load[lo] + take;
-            const double mx   = nh > nl ? nh : nl;
+            const double nh = (rows[hi] - ggml_numa_expert_cost(a, hi, n_nodes, counts)) / cap[hi];
+            const double nl = (rows[lo] + ggml_numa_expert_cost(a, lo, n_nodes, counts)) / cap[lo];
+            const double mx = nh > nl ? nh : nl;
             if (mx < best_max - 1e-9) {
                 best_max = mx;
                 best     = a;
@@ -4788,8 +4802,8 @@ static void ggml_numa_moe_assign(int n_as, const int64_t * counts, int n_nodes) 
         if (best < 0) {
             break;
         }
-        load[hi] -= ggml_numa_expert_cost(best, hi, n_nodes, counts);
-        load[lo] += ggml_numa_expert_cost(best, lo, n_nodes, counts);
+        rows[hi] -= ggml_numa_expert_cost(best, hi, n_nodes, counts);
+        rows[lo] += ggml_numa_expert_cost(best, lo, n_nodes, counts);
         g_numa_expert_node[best] = lo;
 #if defined(__gnu_linux__)
         g_numa_moe_stats.moves++; // ith==0 only, ops run sequentially -- same safety as the census
@@ -4803,8 +4817,9 @@ static void ggml_numa_moe_assign(int n_as, const int64_t * counts, int n_nodes) 
     if (g_numa_stats_level) {
         double tot = 0.0, mx = 0.0;
         for (int k = 0; k < n_nodes; ++k) {
-            tot += load[k];
-            if (load[k] > mx) mx = load[k];
+            const double t = rows[k]/cap[k];
+            tot += t;
+            if (t > mx) mx = t;
         }
         if (tot > 0.0) {
             g_numa_moe_stats.after_sum += mx / (tot / n_nodes);
@@ -5484,15 +5499,17 @@ void ggml_numa_stats_print(void) {
             // its busiest node under owner(e) = e % n_nodes: 1.00 is a perfect split, 2.00 means
             // one node does everything. This, not the cumulative per-node totals, is the
             // throughput a shard run gives up to routing imbalance.
-            fprintf(stderr, "numa_stats: moe_node_skew_mean=%.3f moe_node_skew_max=%.3f over %llu ops\n",
+            // pure key=value: parse_numa_stats treats any bare token as a prefix for the rest
+            // of the line, so free text here would silently rename the keys after it
+            fprintf(stderr, "numa_stats: moe_node_skew_mean=%.3f moe_node_skew_max=%.3f moe_node_skew_ops=%llu\n",
                     g_numa_moe_stats.skew_sum / (double) g_numa_moe_stats.skew_ops,
                     g_numa_moe_stats.skew_max,
                     (unsigned long long) g_numa_moe_stats.skew_ops);
             // NB: skew above is always measured against the owner() split, so it stays comparable
             // across runs and shows the imbalance the rebalancer was asked to remove.
             if (g_numa_shard_steal && g_numa_moe_stats.after_ops > 0) {
-                fprintf(stderr, "numa_stats: moe_rebalance=1 cost=%.2f moves=%llu (%.2f per op) "
-                        "skew_after=%.3f (from %.3f)\n",
+                fprintf(stderr, "numa_stats: moe_rebalance=1 moe_steal_cost=%.2f moe_moves=%llu "
+                        "moe_moves_per_op=%.2f moe_skew_after=%.3f moe_skew_before=%.3f\n",
                         g_numa_steal_cost, (unsigned long long) g_numa_moe_stats.moves,
                         (double) g_numa_moe_stats.moves / (double) g_numa_moe_stats.skew_ops,
                         g_numa_moe_stats.after_sum / (double) g_numa_moe_stats.after_ops,
@@ -19431,7 +19448,7 @@ static void ggml_compute_forward_mul_mat_id(
 #endif
         // expert -> node assignment for this op, published by the barrier below along with
         // matrix_row_counts. No-op unless expert sharding + rebalancing are both on.
-        ggml_numa_moe_assign(n_as, matrix_row_counts, ggml_numa_node_count());
+        ggml_numa_moe_assign(n_as, matrix_row_counts, ggml_numa_node_count(), nth);
     }
 
     ggml_barrier(params->shared);
@@ -19729,7 +19746,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 #endif
         // expert -> node assignment for this op, published by the barrier below along with
         // matrix_row_counts. No-op unless expert sharding + rebalancing are both on.
-        ggml_numa_moe_assign(n_as, matrix_row_counts, ggml_numa_node_count());
+        ggml_numa_moe_assign(n_as, matrix_row_counts, ggml_numa_node_count(), nth);
     }
 
     ggml_barrier(params->shared);

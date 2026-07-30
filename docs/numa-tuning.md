@@ -153,7 +153,13 @@ Effect on the testbed (`skew_after`, remote penalty included):
 
 **This has not been measured on Pandora yet**, which is why the knob ships off. The testbed
 cannot answer it: under a fake topology `mbind` is a no-op, so every "remote" read is really
-local. Three runs at identical model, threads, context and prompt:
+local.
+
+```sh
+./scripts/pandora-tune.sh shard -m /models/big-moe.gguf -t 128
+```
+
+That runs the three cases and prints `r` plus the exact `GGML_NUMA_SHARD_STEAL_COST` to export:
 
 ```sh
 A: --numa mirror                                      # all local, balanced
@@ -165,14 +171,17 @@ C: --numa-mirror dense,kv                             # node-aware, local, imbal
 the *same* work in the *same* split and differ only in locality — which is what isolates the
 penalty instead of confounding it with imbalance.
 
-- **`r ≈ B/A`** (on the TG number; that is where the skew bites).
-- **`C/A`** is what node-aware scheduling nets today, after paying the skew.
+In B every node still computes every expert, so about half the expert bytes cross the link:
+`tg_B ≈ tg_A / (0.5 + 0.5r)`, hence **`r ≈ 2·(tg_A/tg_B) − 1`**. That is first-order and assumes
+TG time is dominated by streaming expert weights — true for a large MoE, less so if you have
+most layers on the GPU. **`C/A`** is the separate question of what sharding costs against
+mirroring, and `C/A < 1` is expected: sharding is how you *fit* a model, not how you speed one up.
 
 Then set `GGML_NUMA_SHARD_STEAL_COST` to the measured `r`, enable
 `GGML_NUMA_SHARD_STEAL=1`, and confirm with `GGML_NUMA_STATS=1`:
 
 ```
-numa_stats: moe_rebalance=1 cost=1.50 moves=648 (0.59 per op) skew_after=1.087 (from 1.340)
+numa_stats: moe_rebalance=1 moe_steal_cost=1.50 moe_moves=648 moe_moves_per_op=0.59 moe_skew_after=1.087 moe_skew_before=1.340
 ```
 
 `moe_node_skew_mean` deliberately keeps scoring the untouched `e % n_nodes` split, so
@@ -211,9 +220,8 @@ Recommended order and where each answer goes:
 `all` runs 1–5 (plus 7–8 when hybrid flags are passed). Lists are overridable via env
 (`GATE_LIST`, `COPY_THREADS_LIST`, `NT_LIST`, `THREADS_LIST`, `RESERVE_LIST`).
 
-The expert-sharding knobs (`--numa-mirror dense`, `GGML_NUMA_SHARD_STEAL[_COST]`) have **no
-`pandora-tune.sh` subcommand yet** — they only matter for models that cannot be mirrored, and
-their one measurement is the three-run A/B in
+The expert-sharding knobs have their own subcommand, `shard`, kept out of `all` because they
+only matter for MoE models that cannot be mirrored. See
 [Expert sharding and rebalancing](#expert-sharding-and-rebalancing---numa-mirror-dense).
 
 ### Measured on Pandora — GLM 5.2, 2× EPYC 9665 (2026-07)

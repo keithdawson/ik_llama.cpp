@@ -163,6 +163,8 @@ that is low-parallelism ops (nth < n_threads) always landing on the lowest threa
 
 | E12 expert sharding (`--numa-mirror dense,kv`) | **implemented**, correctness validated locally; speed verdict needs Pandora. Confirms E11's per-token warning with a number: aggregate per-node balance is ~1.01 and **misleading**, because each MoE op ends at a barrier and runs at its busiest node's pace. Use it for models that don't fit mirrored, not as a speedup | byte-identical output on Qwen1.5-MoE + gemma-4 (fused / `-no-fmoe` / `-no-fug`); footprint 2×7.39 → 2×1.02+6.37 GiB (Qwen), 2×13.4 → 2×3.13+10.25 GiB (gemma-4); `moe_node_skew_mean` TG **1.32** / **1.25**, max **2.00**; PP **1.07** |
 
+| E13 expert rebalancing (`GGML_NUMA_SHARD_STEAL`) | **implemented**, default off pending the on-target `r` measurement (`pandora-tune.sh shard`). Built as a deterministic greedy over `matrix_row_counts` rather than opportunistic stealing, so it needs no atomics/extra barrier and stays **bit-identical**. Self-limiting: at `r >= 2` a move cannot pay for itself and it declines to move | `skew_after` at `r` = 1.0 / 1.3 / 1.5 / 2.0 — Qwen1.5-MoE 1.34 → **1.00 / 1.05 / 1.09 / 1.24**; gemma-4 1.25 → **1.00 / 1.04 / 1.07 / 1.13**. Byte-identical at every ratio, incl. `GGML_NUMA_FAKE=4` (2.05 → 1.23) and `RESERVE_CPUS=2@1` (→ 1.15). Cost model works in time units (rows ÷ node threads), so asymmetric nodes are handled; symmetric numbers unchanged |
+
 ## Experiment log convention
 
 One directory per experiment under `testbed-results/`, plus a row appended to

@@ -55,8 +55,8 @@ bandwidth on both sockets. Built for a 2× EPYC 9665 (2 nodes, 12 DDR5 channels 
 Expert sharding — only for MoE models too large to mirror, and **not a speedup over
 mirroring**: `--numa-mirror dense,kv` (one copy of the routed experts, pinned per node)
 plus `GGML_NUMA_SHARD_STEAL` / `GGML_NUMA_SHARD_STEAL_COST` (rebalances lopsided routing;
-bit-identical). No `pandora-tune.sh` subcommand — the one thing to measure is the
-remote-read penalty `r`, via the three-run A/B in
+bit-identical). Measure the remote-read penalty `r` first with
+`pandora-tune.sh shard` (kept out of `all`); background in
 [docs/numa-tuning.md](docs/numa-tuning.md#expert-sharding-and-rebalancing---numa-mirror-dense).
 `GGML_NUMA_SHARD_SCHED=0` exists only for that measurement.
 

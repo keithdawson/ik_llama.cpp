@@ -276,6 +276,51 @@ def cmd_smoke(args):
     check("identity: mirror == mirror+pin", out1 == out3)
     check("identity: mirror == mirror+nt-copy", out1 == out4)
 
+    # 4. expert sharding (--numa-mirror dense). On a dense model there are no routed experts,
+    # so this only exercises the per-tensor arena path and the "no experts" fallback -- which is
+    # still worth gating, since that path replaces buffer-level mirroring entirely.
+    out5, err5 = smoke_run(binary, model, ["--numa-mirror", "dense,kv"], {"GGML_NUMA_FAKE": "2"})
+    check("identity: baseline == dense-shard", out0 == out5)
+    check("dense-shard: weights mirrored via arena",
+          re.search(r"duplicat\w* \d+ weight tensors", out5 + err5) is not None)
+
+    # 5. the sharding itself needs an MoE model; opt-in so the default gate stays fast
+    moe = getattr(args, "moe_model", None)
+    if moe:
+        print("\n-- MoE shard/rebalance checks (%s) --" % os.path.basename(moe), flush=True)
+        mbase, _ = smoke_run(binary, moe, [], {"GGML_NUMA_STATS": "0"})
+        msh, msherr = smoke_run(binary, moe, ["--numa-mirror", "dense,kv"], {"GGML_NUMA_FAKE": "2"})
+        mlog = msh + msherr
+        check("moe shard: experts pinned per node",
+              re.search(r"NUMA shard: pinned \d+ expert slices", mlog) is not None)
+        check("moe shard: shared experts mirrored, not sharded",
+              ("mirrored, not sharded" in mlog) or ("no shared-expert tensors" in mlog))
+        check("moe identity: baseline == shard", mbase == msh)
+        mst = parse_numa_stats(mlog)
+        check("moe shard: node-aware scheduling ran",
+              mst.get("node0_moe_experts", 0) > 0 and mst.get("node1_moe_experts", 0) > 0,
+              str({k: v for k, v in mst.items() if "moe_experts" in k}))
+
+        # SHARD_SCHED=0 keeps placement but restores the old schedule (the r-measurement knob)
+        mso, msoerr = smoke_run(binary, moe, ["--numa-mirror", "dense,kv"],
+                                {"GGML_NUMA_FAKE": "2", "GGML_NUMA_SHARD_SCHED": "0"})
+        check("moe identity: baseline == shard+sched-off", mbase == mso)
+        check("moe shard: SHARD_SCHED=0 bypasses node-aware path",
+              parse_numa_stats(mso + msoerr).get("node0_moe_experts", 0) == 0)
+
+        # the rebalancer must never change output, and must move less as the remote cost rises
+        moves = {}
+        for cost in ("1.0", "2.0"):
+            mrb, mrberr = smoke_run(binary, moe, ["--numa-mirror", "dense,kv"],
+                                    {"GGML_NUMA_FAKE": "2", "GGML_NUMA_SHARD_STEAL": "1",
+                                     "GGML_NUMA_SHARD_STEAL_COST": cost})
+            check("moe identity: baseline == rebalanced (cost=%s)" % cost, mbase == mrb)
+            moves[cost] = parse_numa_stats(mrb + mrberr).get("moe_moves", -1)
+        check("moe rebalance: moves at cost=1.0", moves.get("1.0", 0) > 0, "moves=%s" % moves.get("1.0"))
+        check("moe rebalance: self-limiting as cost rises",
+              0 <= moves.get("2.0", -1) < moves.get("1.0", 0),
+              "cost1.0=%s cost2.0=%s" % (moves.get("1.0"), moves.get("2.0")))
+
     print("\nsmoke: %s" % ("OK" if not failures else "FAILED: " + ", ".join(failures)))
     return 1 if failures else 0
 
@@ -294,6 +339,9 @@ def main():
     p = sub.add_parser("smoke", help="functional gate on a small model")
     p.add_argument("--model", required=True)
     p.add_argument("--bin", default="/src/build-testbed/bin/llama-cli")
+    p.add_argument("--moe-model", default=None,
+                   help="optional MoE gguf; adds expert-sharding and rebalancer checks "
+                        "(the dense --model cannot exercise them)")
 
     args = ap.parse_args()
     if args.cmd == "run":

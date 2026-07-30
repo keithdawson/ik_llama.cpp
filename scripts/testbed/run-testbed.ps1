@@ -27,6 +27,9 @@ param(
     [int]$FakeNodes = 2,
     [string]$XgmiGbps = "60",
     [string]$SmokeModel = "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    # MoE gguf for the expert-sharding / rebalancer checks; the dense smoke model has no routed
+    # experts and cannot exercise them. Pass -MoeModel "" to skip and keep the gate fast.
+    [string]$MoeModel = "/models/Qwen1.5-MoE-A2.7B-Chat.IQ4_XS.gguf",
     [int]$Cores = 8
 )
 
@@ -117,8 +120,10 @@ switch ($Command) {
         Invoke-Testbed -Cmd @("bash", "/src/scripts/testbed/download-model.sh")
     }
     "smoke" {
-        Invoke-Testbed -Pinned -Cmd @("python3", "/src/scripts/testbed/testbed-ab.py", "smoke",
+        $smokeArgs = @("python3", "/src/scripts/testbed/testbed-ab.py", "smoke",
             "--model", $SmokeModel, "--bin", "/build/main/bin/llama-cli")
+        if ($MoeModel) { $smokeArgs += @("--moe-model", $MoeModel) }
+        Invoke-Testbed -Pinned -Cmd $smokeArgs
     }
     "ab" {
         if (-not $Config) { throw "ab requires -Config <path to json>" }
