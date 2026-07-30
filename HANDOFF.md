@@ -41,9 +41,9 @@ with sharding *off*, so a plain `--numa mirror` run predicts the cost for any mo
 
 ---
 
-## 2. RESEARCH FINDINGS (2026-07-28) — read before planning K3 work
+## 2. RESEARCH FINDINGS — read before planning K3 work
 
-### Kimi K3 will not load today, and the gap is much bigger than "add an arch enum"
+### Kimi K3 will not load today, but the port is mostly graph plumbing (revised 2026-07-29)
 
 From `moonshotai/Kimi-K3` `config.json` and the llama.cpp work:
 
@@ -58,24 +58,67 @@ From `moonshotai/Kimi-K3` `config.json` and the llama.cpp work:
 | extras | AttnRes (cross-layer residuals, softmax mixture over depth), Stable LatentMoE (router projects to latent 3584), multimodal vision, 1M context |
 | quant | `mxfp4-pack-quantized` (compressed-tensors, group 32); **self-attention, shared experts, MLPs and lm_head excluded from quantization** → those stay bf16 |
 
-Status elsewhere:
-- **ik_llama has no Kimi arch at all** — not `kimi_k3`, not even `kimi_linear`. Confirmed by
-  grepping `src/llama-arch.h`.
-- **Mainline llama.cpp has not merged it either.** Support lives in open PR
-  [ggml-org/llama.cpp#26185](https://github.com/ggml-org/llama.cpp/pull/26185) (8 commits,
-  under community test): HF→GGUF conversion with lossless MXFP4 repack, the hybrid KDA+MLA
-  graph, latent MoE, cross-layer residuals, `LLAMA_MAX_EXPERTS` 512→1024. Known open issues
-  include prompt-cache reuse corrupting recurrent KDA state. Groundwork discussion:
+Status as of **2026-07-29** (rechecked; the first read of this was too pessimistic):
+- **ik_llama has no Kimi arch** — not `kimi_k3`, not `kimi_linear`. `upstream/main` @ `6647db9c`
+  is one commit past our merge base and has nothing K3. Related upstream branches: `ik/mxfp4`,
+  `ik/mxfp4_r8` (quant kernels), `ik/fix_kimi2_parse` (**K2**, not K3).
+- **Mainline llama.cpp has not merged it either.** Open PR
+  [ggml-org/llama.cpp#26185](https://github.com/ggml-org/llama.cpp/pull/26185): +1939/-30 over
+  21 files, 8 commits, still moving (updated 2026-07-29), community-validated on real
+  checkpoints, awaiting maintainer review. Groundwork:
   [#26041](https://github.com/ggml-org/llama.cpp/discussions/26041).
 
-**Implication:** K3 on this fork means porting an unmerged upstream architecture (KDA recurrent
-attention + AttnRes + latent MoE + mxfp4) into a tree that has diverged heavily from mainline
-(iqk kernels, its own MoE paths). That is an architecture project, not a NUMA project, and it
-is not a prerequisite for the sharding work — **the sharding work is model-agnostic and pays
-off on any MoE too large to mirror.** Do not couple them.
+**The port is much smaller than "an architecture project".** The giveaway is that PR #26185
+touches **no `ggml/` files at all** — it is built from ops mainline already had, and *this fork
+already has those ops too*, inherited from two models it already supports:
 
-Cheapest next step if K3 is wanted: try a community GGUF (built from the PR branch) against
-`llama-cli` and read the unknown-architecture error, to confirm the gap rather than assume it.
+| K3 needs | we have | via |
+|---|---|---|
+| KDA (gated delta attention) | `ggml_delta_net(q,k,v,g,beta,state,saved_steps)` | Qwen3-Next |
+| AttnRes cross-layer residuals | `ggml_hc_pre` / `ggml_hc_post` | DeepSeek-V4 (mainline: `ggml_dsv4_hc_pre`) |
+| MLA | ✓ | deepseek2 / GLM-DSA |
+| MXFP4 | `GGML_TYPE_MXFP4 = 39` — commented *"so we are compatible with mainline"* | ik/mxfp4 |
+| hybrid linear+full attention KV cache | `llm_arch_is_hybrid` | Qwen3-Next |
+
+Qwen3-Next is itself a hybrid linear+full attention MoE, so K3's structural pattern is already
+exercised here. Posted MXFP4 GGUFs should be **byte-compatible** — that type ID was matched on
+purpose.
+
+Remaining work, roughly in order of cost:
+1. `LLAMA_MAX_EXPERTS` 512 → ≥896 (`src/llama-hparams.cpp:10`; mainline went to 1024).
+2. **`situ` activation is genuinely missing**, plus `situ_beta` / `situ_linear_beta`.
+3. Arch registration: `"kimi-k3"`, 5 new KV keys (`attn_res.block_size`,
+   `activation.situ_beta`, `activation.situ_linear_beta`, `expert_latent_length`,
+   `kda.gate_lower_bound`) and 7 new tensors (`ssm_g`, `attn_res_score`, `ffn_res_score`,
+   `output_res_score`, `ffn_routed_{up,down,norm}`).
+4. **Graph build — the real work**: port the 645-line `src/models/kimi-k3.cpp` onto this fork's
+   `src/graphs/build_*.cpp` API. Different API, so a rewrite rather than a copy.
+5. Conversion (390-line `conversion/kimi_k3.py`; mainline restructured into a `conversion/`
+   package while we still have a monolithic `convert_hf_to_gguf.py`) — **skippable if we load
+   community GGUFs instead of converting.**
+6. Chat template + reasoning/tool parser (`models/templates/Kimi-K3.jinja` + `common/chat.cpp`);
+   ours is the `chat-peg-parser`, theirs is not.
+
+**Our expert sharding already lands correctly on K3 — no changes needed.** Verified through the
+conversion: `MODEL_TENSOR.FFN_{GATE,UP,DOWN}_EXP` (singular) maps to the *plural* name string
+`blk.{bid}.ffn_*_exps`, and the converter stacks experts into one `[n_expert, rows, cols]`
+tensor. So routed experts get sharded, while `ffn_routed_{up,down,norm}` (the latent-MoE
+projections — per-layer, shared across experts, so dense-like) and `_shexp` fall into the
+mirrored set, which is right. K3 is also the case that *needs* sharding: ~1.5 TB at mxfp4 means
+mirroring wants ~3 TB and does not fit, whereas sharding is ~1.5 TB + dense×2.
+
+**Risks:** the PR is unmerged and still changing, so porting now means re-porting if reviewers
+ask for changes. And one known upstream bug hits this deployment directly — **prefix-cache reuse
+corrupts recurrent KDA state in multi-turn conversations**, which for an Open-WebUI setup is not
+cosmetic. Low-bit (≤Q2) quality degradation is also reported.
+
+**Recommended sequence:** wait for #26185 to merge before porting the graph, but do items 1-3
+now (stable regardless of PR churn), then point `llama-cli` at a posted GGUF to turn the
+remaining gap into a concrete unknown-tensor/KV error list instead of speculation.
+
+Also new upstream: `ik/cpu_chunked_experts` (+236 in `ggml.c`, plus `getrows.cu`). It does
+**not** touch `mul_mat_id`, so it should not conflict with our stage-2 edits — but it is MoE
+CPU work, so check it before the next upstream merge.
 
 ### GLM-5.2 does have shared experts — one, not two
 
