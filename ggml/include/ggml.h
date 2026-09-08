@@ -820,7 +820,13 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        // char padding[4];
+        // NUMA mirror: when non-NULL, points to a struct ggml_numa_mirror holding one
+        // node-local copy of this tensor's data per NUMA node (see ggml_numa_tensor_data).
+        // NULL for the vast majority of tensors (the "not mirrored" sentinel).
+        void * data_numa;
+
+        // keep sizeof(struct ggml_tensor) a multiple of GGML_MEM_ALIGN (data_numa added 8 bytes)
+        char padding[8];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
@@ -891,6 +897,9 @@ extern "C" {
         bool   no_alloc;   // don't allocate memory for the tensor data
     };
 
+    // maximum number of NUMA nodes ggml will track / mirror across
+    #define GGML_NUMA_MAX_NODES 8
+
     // numa strategies
     enum ggml_numa_strategy {
         GGML_NUMA_STRATEGY_DISABLED   = 0,
@@ -899,6 +908,22 @@ extern "C" {
         GGML_NUMA_STRATEGY_NUMACTL    = 3,
         GGML_NUMA_STRATEGY_MIRROR     = 4,
         GGML_NUMA_STRATEGY_COUNT
+    };
+
+    // which read-mostly data to duplicate per NUMA node when GGML_NUMA_STRATEGY_MIRROR is active.
+    // these are bit flags so they can be OR-ed together (see ggml_numa_set_mirror).
+    enum ggml_numa_mirror_flags {
+        GGML_NUMA_MIRROR_WEIGHTS     = 1 << 0, // model weight tensors (routed experts included)
+        GGML_NUMA_MIRROR_KV          = 1 << 1, // K/V cache
+        GGML_NUMA_MIRROR_ACTIVATIONS = 1 << 2, // reserved: per-node matmul scratch (not implemented)
+        // mirror every weight EXCEPT the routed-expert tensors, which instead get a single
+        // copy pinned to one owner node ("expert-affinity sharding"). Total weight footprint
+        // is then dense*n_nodes + experts*1 instead of everything*n_nodes, which is what makes
+        // a ~1.5 TB MoE fit on a 2.25 TB box. Correctness is free: a sharded tensor is just a
+        // mirror with one populated slot, and ggml_numa_tensor_data() already falls back to
+        // t->data (a remote read) for the NULL slots. Ignored if WEIGHTS is also set.
+        GGML_NUMA_MIRROR_DENSE       = 1 << 3,
+        GGML_NUMA_MIRROR_ALL = GGML_NUMA_MIRROR_WEIGHTS | GGML_NUMA_MIRROR_KV,
     };
 
     //
@@ -922,8 +947,49 @@ extern "C" {
     // accepts a UTF-8 path, even on Windows
     GGML_API FILE *  ggml_fopen(const char * fname, const char * mode);
 
-    GGML_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
-    GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    GGML_API void ggml_numa_init(enum ggml_numa_strategy numa_flag);
+    // bind non-mirrored host allocations (ggml context buffers) to the NUMA node the GPU is
+    // attached to, so GPU<->CPU traffic stays local to that socket. Purely a memory-placement
+    // hint: compute still runs on all threads of all nodes. -1 (default) disables the binding.
+    GGML_API void ggml_numa_set_primary_gpu_node(int node);
+    GGML_API int  ggml_numa_get_primary_gpu_node(void);
+    // additionally bind the scheduler's CPU compute buffers (intermediate tensor data,
+    // i.e. what the GPU DMAs from/to) to the primary GPU node. Trade-off: GPU transfers
+    // become node-local, but expert threads on other nodes write their outputs remotely.
+    GGML_API void ggml_numa_set_bind_compute(bool enable);
+    GGML_API bool ggml_numa_get_bind_compute(void);
+
+    // true if a numa strategy is active
+    GGML_API bool ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+
+    // NUMA mirroring (GGML_NUMA_STRATEGY_MIRROR): duplicate read-mostly data per NUMA node
+    GGML_API int      ggml_numa_node_count(void);                  // number of NUMA nodes detected (>=1)
+    GGML_API bool     ggml_numa_mirror_active(void);               // true if strategy == MIRROR and >1 node
+    // expert-affinity sharding: set once at load when routed-expert weights were pinned one
+    // node each rather than mirrored, so the MoE kernels know to compute expert e only on the
+    // threads of node e % n_nodes (its weights are node-local only there).
+    GGML_API void     ggml_numa_set_expert_shard(bool enable);
+    GGML_API bool     ggml_numa_expert_shard_active(void);
+    GGML_API void     ggml_numa_set_mirror(uint32_t flags);        // which ggml_numa_mirror_flags to mirror
+    GGML_API uint32_t ggml_numa_get_mirror(void);                  // current mirror flags
+    GGML_API int      ggml_numa_node_for_thread(int ith, int nth); // block split of threads across nodes
+    // allocate/free memory bound to a specific NUMA node (mmap + mbind + THP)
+    GGML_API void *   ggml_numa_alloc(size_t size, int node);
+    GGML_API void     ggml_numa_free(void * ptr, size_t size);
+    // parallel memcpy using threads pinned to the destination node (writes stay node-local).
+    // Falls back to plain memcpy for small sizes or when node/threads are unavailable.
+    GGML_API void     ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int node);
+    // best-effort migrate an already-populated range onto a node (mbind + MPOL_MF_MOVE)
+    GGML_API void     ggml_numa_bind(void * ptr, size_t size, int node);
+    // attach/detach per-node copies to a tensor. node_data must have ggml_numa_node_count() entries.
+    GGML_API void     ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data);
+    GGML_API void     ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor);
+    // re-sync node copies after a write that bypassed graph-CPY replication (state restore, K-shift, clear)
+    GGML_API void     ggml_numa_tensor_resync(struct ggml_tensor * tensor);
+    // GGML_NUMA_STATS diagnostics: 0=off, 1=dump counters at exit, 2=also dump+reset per llama_print_timings
+    GGML_API int      ggml_numa_stats_level(void);
+    // print "numa_stats: key=value" lines to stderr (resets the counters when level >= 2)
+    GGML_API void     ggml_numa_stats_print(void);
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);

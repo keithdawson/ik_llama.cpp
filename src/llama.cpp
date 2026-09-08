@@ -415,6 +415,18 @@ static const char * llama_expert_gating_func_name(llm_expert_gating_func_type ty
 }
 
 llama_model::~llama_model() {
+    // free NUMA mirror per-tensor pointer tables and the extra node-local weight copies
+    for (struct ggml_context * ctx : ctxs) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            ggml_numa_tensor_clear_mirror(t);
+        }
+    }
+    for (auto & mb : numa_mirror_bufs) {
+        for (int n = 1; n < ggml_numa_node_count(); ++n) { // node_base[0] aliases the original buffer
+            ggml_numa_free(mb.node_base[n], mb.size);
+        }
+    }
+    numa_mirror_bufs.clear();
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
@@ -1152,6 +1164,7 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
     return n_slots > 0 && seq_id >= 0 && (uint32_t) seq_id < n_slots;
 }
 
+static void llama_mirror_kv_cache(struct llama_kv_cache & cache); // defined below, near llama_mirror_model_weights
 static bool llama_mtp_tail_uses_layer_cache(const llama_model & model) {
     return model.hparams.nextn_predict_layers > 0 &&
         (model.arch == LLM_ARCH_GLM_DSA ||
@@ -1679,6 +1692,10 @@ static bool llama_kv_cache_init(
         }
     }
 #endif
+
+    // NUMA mirror: duplicate the KV cache per node (writes are replicated in the graph; reads
+    // are redirected per thread). Runs once the KV buffers exist and have been cleared.
+    llama_mirror_kv_cache(cache);
 
     return true;
 }
@@ -2375,6 +2392,13 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
 
     for (auto & buf : cache.bufs) {
         ggml_backend_buffer_clear(buf, 0);
+    }
+    // ggml_backend_buffer_clear zeroes only node 0; mirror the zeroing to the other node copies
+    // (defensive — cleared cells are normally rewritten before re-read, but keep copies consistent)
+    if (!cache.numa_mirror_bufs.empty()) {
+        for (auto * t : cache.k_l) ggml_numa_tensor_resync(t);
+        for (auto * t : cache.v_l) ggml_numa_tensor_resync(t);
+        for (auto * t : cache.s_l) ggml_numa_tensor_resync(t);
     }
 }
 
@@ -5073,6 +5097,16 @@ static bool llm_load_tensors(
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static int llama_model_load(const std::string & fname, llama_model & model, llama_model_params & params) {
     try {
+        // NUMA weight mirroring needs writable, owned (non-mmap) weight buffers: the per-node
+        // copies are made from the repacked bytes, and repacking only runs for non-mmap loads.
+        // The dense/shard mode needs it for a second reason: expert placement is done with
+        // mbind(MPOL_MF_MOVE), which cannot relocate the shared page-cache pages behind a file
+        // mapping, so with mmap the sharding would silently not happen.
+        if (params.use_mmap && ggml_numa_mirror_active() &&
+                (ggml_numa_get_mirror() & (GGML_NUMA_MIRROR_WEIGHTS | GGML_NUMA_MIRROR_DENSE))) {
+            LLAMA_LOG_INFO("%s: NUMA mirror: forcing --no-mmap so weights can be duplicated per node\n", __func__);
+            params.use_mmap = false;
+        }
         llama_model_loader ml(fname, params.ncmoe, params.use_mmap, params.check_tensors,
                 params.repack_tensors, params.use_thp, params.merge_qkv, params.merge_up_gate_exps,
                 params.defer_experts,
@@ -7637,6 +7671,15 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
 
             llama_graph_compute(lctx, gf, lctx.cparams.n_threads);
 
+            // For non-quantized K, the K-shift rotates k_l *in place* (RoPE), bypassing the
+            // graph-CPY mirror replication, so the per-node copies keep the un-rotated K.
+            // Re-sync them. No-op when NUMA mirroring is off. (Cold path: only on context shift.)
+            if (!lctx.kv_self.numa_mirror_bufs.empty()) {
+                for (auto * t : lctx.kv_self.k_l) {
+                    ggml_numa_tensor_resync(t);
+                }
+            }
+
             need_reserve = true;
         }
 
@@ -7710,6 +7753,9 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
         lctx.reset_scheduler();
         if (!ggml_backend_sched_reserve(lctx.sched, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        } else if (ggml_numa_get_bind_compute()) {
+            // re-reserve may have replaced the CPU compute buffers; re-bind them
+            ggml_backend_sched_numa_bind_cpu_buffers(lctx.sched, ggml_numa_get_primary_gpu_node());
         }
     }
     return 0;
@@ -8294,6 +8340,405 @@ void llama_free_model(struct llama_model * model) {
         }
     }
     delete model;
+}
+
+#if defined(__linux__)
+static size_t llama_get_available_ram_bytes() {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "MemAvailable: %zu kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return kb * 1024;
+}
+#else
+static size_t llama_get_available_ram_bytes() { return 0; }
+#endif
+
+// Duplicate the model's host weight buffers once per NUMA node and point each weight tensor at its
+// per-node copies (see ggml_numa_tensor_data). Must run AFTER all weight repacking (load-time and
+// the context-time up/gate merge) so the mirrored bytes are final. Idempotent per model.
+// Routed ("merged") expert weight tensors: the ones whose last dimension indexes the expert.
+// Deliberately excludes ffn_norm_exps (a tiny per-layer norm) and every *_shexp shared-expert
+// tensor -- those are read on every token by every thread, so they belong in the mirrored set
+// with the rest of the dense weights.
+//
+// The *_shexp exclusion is load-bearing, not incidental. Shared experts are active for every
+// token (GLM-5.2 has 1, Kimi K3 has 2 alongside its 16-of-896 routed), so mirroring them keeps
+// every node's copy local and, once expert compute is split across nodes, keeps them out of any
+// cross-node reduction: each node computes the shared expert redundantly from local weights and
+// adds it locally. Sharding them instead would put a permanently-hot tensor on one node and
+// drag it into the reduction. Note the names do not collide -- "ffn_up_shexp" does not contain
+// "ffn_up_exps" -- so substring matching is safe here.
+static bool llama_numa_is_routed_expert(const struct ggml_tensor * t) {
+    const char * n = t->name;
+    return strstr(n, "ffn_gate_up_exps") || strstr(n, "ffn_gate_exps") ||
+           strstr(n, "ffn_up_exps")      || strstr(n, "ffn_down_exps");
+}
+
+static bool llama_numa_is_shared_expert(const struct ggml_tensor * t) {
+    return strstr(t->name, "shexp") != NULL;
+}
+
+// Pin each expert's slice of a merged expert tensor to an owner node.
+//
+// All experts of a layer live in ONE [n_embd, n_ff, n_expert] tensor and expert e is the byte
+// range [e*nb[2], (e+1)*nb[2]) (see ggml_compute_forward_mul_mat_id: src0_cur = src0_data +
+// cur_a*nb02). So "expert e lives on node N" is a placement property of a single copy, set with
+// mbind -- not a second copy. The mirror table is left empty for these tensors, so
+// ggml_numa_tensor_data() keeps returning t->data on every node.
+//
+// owner(e) = e % n_nodes is layer-independent on purpose: expert e sits on the same node in
+// every layer, so stage-2 scheduling can derive the owner arithmetically with no lookup table.
+static int llama_numa_shard_expert_tensor(struct ggml_tensor * t, int n_nodes, size_t * per_node_bytes) {
+    const int64_t n_expert = t->ne[2];
+    if (n_expert < 2) {
+        return 0; // not actually a merged-expert layout; leave it where the loader put it
+    }
+    const size_t stride = t->nb[2];
+    // Trim each slice to whole pages: mbind rounds the start down to a page boundary, which
+    // would otherwise let expert e's binding claim the tail page of expert e-1.
+    const size_t pg = 4096;
+    for (int64_t e = 0; e < n_expert; ++e) {
+        const size_t beg = GGML_PAD((size_t) (e * stride), pg);
+        const size_t end = ((size_t) ((e + 1) * stride)) & ~(pg - 1);
+        const int node = (int) (e % n_nodes);
+        if (end > beg) {
+            ggml_numa_bind((char *) t->data + beg, end - beg, node);
+        }
+        per_node_bytes[node] += stride;
+    }
+    return (int) n_expert;
+}
+
+// --numa-mirror dense: mirror every weight EXCEPT the routed experts, which instead get a
+// single copy pinned to an owner node. Weight footprint becomes dense*n_nodes + experts*1,
+// which is what lets a ~1.5 TB MoE run on a box that cannot hold 2x of it.
+//
+// Unlike the all-weights path below, this cannot work at buffer granularity: dense and expert
+// tensors share the same backend buffers, so skipping experts requires per-tensor placement.
+// Dense tensors are copied into one arena per node; experts are never copied, only bound.
+static void llama_mirror_dense_shard_experts(const llama_model & model, int n_nodes) {
+    const size_t align = 64; // keep every arena slot AVX-512-aligned
+
+    // pass 1: classify and size
+    size_t dense_bytes = 0, expert_bytes = 0, shexp_bytes = 0;
+    int n_dense_t = 0, n_expert_t = 0, n_shexp_t = 0;
+    for (struct ggml_context * ctx : model.ctxs) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const size_t nb = ggml_nbytes(t);
+            if (llama_numa_is_routed_expert(t)) {
+                expert_bytes += nb;
+                ++n_expert_t;
+            } else {
+                dense_bytes += GGML_PAD(nb, align);
+                ++n_dense_t;
+                if (llama_numa_is_shared_expert(t)) { // subset of the dense set, reported separately
+                    shexp_bytes += nb;
+                    ++n_shexp_t;
+                }
+            }
+        }
+    }
+    if (dense_bytes == 0) {
+        return;
+    }
+
+    const size_t extra_needed = dense_bytes * (size_t) (n_nodes - 1); // node 0 reads the originals
+    const size_t avail = llama_get_available_ram_bytes();
+    LLAMA_LOG_INFO("%s: NUMA mirror: %d nodes, dense weights %.2f GiB (%d tensors), routed experts %.2f GiB (%d tensors, sharded); "
+            "need +%.2f GiB for mirrors (%.2f GiB available)\n",
+            __func__, n_nodes, dense_bytes/1073741824.0, n_dense_t, expert_bytes/1073741824.0, n_expert_t,
+            extra_needed/1073741824.0, avail/1073741824.0);
+    if (avail > 0 && extra_needed + (2ull << 30) > avail) {
+        LLAMA_LOG_WARN("%s: NUMA mirror: insufficient free RAM to duplicate dense weights across %d nodes; "
+                "continuing WITHOUT weight mirroring\n", __func__, n_nodes);
+        return;
+    }
+
+    // one arena per remote node, freed by ~llama_model (which skips node_base[0])
+    llama_model::numa_mirror_buffer mb;
+    mb.buf  = nullptr; // arena-backed, not a duplicate of any one backend buffer
+    mb.size = dense_bytes;
+    for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+        mb.node_base[n] = NULL;
+    }
+    for (int n = 1; n < n_nodes; ++n) {
+        void * p = ggml_numa_alloc(dense_bytes, n);
+        if (!p) {
+            for (int k = 1; k < n; ++k) {
+                ggml_numa_free(mb.node_base[k], dense_bytes);
+            }
+            LLAMA_LOG_WARN("%s: NUMA mirror: allocation failed; continuing WITHOUT weight mirroring\n", __func__);
+            return;
+        }
+        mb.node_base[n] = p;
+    }
+    model.numa_mirror_bufs.push_back(mb);
+
+    // pass 2: copy dense tensors into every arena, shard experts in place
+    size_t off = 0;
+    int n_mirrored = 0, n_sharded = 0;
+    size_t per_node_expert[GGML_NUMA_MAX_NODES] = {0};
+    for (struct ggml_context * ctx : model.ctxs) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const size_t nb = ggml_nbytes(t);
+            if (llama_numa_is_routed_expert(t)) {
+                n_sharded += llama_numa_shard_expert_tensor(t, n_nodes, per_node_expert);
+                continue;
+            }
+            void * node_data[GGML_NUMA_MAX_NODES];
+            for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+                node_data[n] = NULL;
+            }
+            node_data[0] = t->data;             // node 0 reads the original ...
+            ggml_numa_bind(t->data, nb, 0);     // ... migrated onto node 0 (best effort)
+            for (int n = 1; n < n_nodes; ++n) {
+                node_data[n] = (char *) mb.node_base[n] + off;
+                ggml_numa_memcpy_to_node(node_data[n], t->data, nb, n);
+            }
+            ggml_numa_tensor_set_mirror(t, node_data);
+            off += GGML_PAD(nb, align);
+            ++n_mirrored;
+        }
+    }
+
+    // Tell the MoE kernels to compute expert e only on node e % n_nodes (stage 2). Only once
+    // experts were really pinned -- if the model had none, the graph should stay node-agnostic.
+    if (n_sharded > 0) {
+        ggml_numa_set_expert_shard(true);
+    }
+
+    LLAMA_LOG_INFO("%s: NUMA mirror: duplicated %d weight tensors across %d nodes\n",
+            __func__, n_mirrored, n_nodes);
+    char dist[256];
+    int  pos = 0;
+    for (int n = 0; n < n_nodes && pos < (int) sizeof(dist) - 32; ++n) {
+        pos += snprintf(dist + pos, sizeof(dist) - pos, "%snode%d %.2f GiB",
+                n ? ", " : "", n, per_node_expert[n]/1073741824.0);
+    }
+    LLAMA_LOG_INFO("%s: NUMA shard: pinned %d expert slices across %d nodes (%s)\n",
+            __func__, n_sharded, n_nodes, dist);
+    // Called out explicitly because it is the property that keeps shared experts off the
+    // cross-node reduction path: they are active every token, so they stay replicated.
+    if (n_shexp_t > 0) {
+        LLAMA_LOG_INFO("%s: NUMA shard: %d shared-expert tensors (%.2f GiB) mirrored, not sharded\n",
+                __func__, n_shexp_t, shexp_bytes/1073741824.0);
+    } else {
+        LLAMA_LOG_INFO("%s: NUMA shard: model has no shared-expert tensors\n", __func__);
+    }
+}
+
+static void llama_mirror_model_weights(const llama_model & model) {
+    const uint32_t flags = ggml_numa_get_mirror();
+    const bool mirror_all   = (flags & GGML_NUMA_MIRROR_WEIGHTS) != 0;
+    const bool mirror_dense = !mirror_all && (flags & GGML_NUMA_MIRROR_DENSE) != 0;
+    if (!ggml_numa_mirror_active() || (!mirror_all && !mirror_dense)) {
+        return;
+    }
+    if (!model.numa_mirror_bufs.empty()) {
+        return; // already mirrored (e.g. a second context created on the same model)
+    }
+    const int n_nodes = ggml_numa_node_count();
+    if (n_nodes < 2) {
+        return;
+    }
+    if (mirror_dense) {
+        llama_mirror_dense_shard_experts(model, n_nodes);
+        return;
+    }
+
+    size_t total_host = 0;
+    for (auto buf : model.bufs) {
+        if (buf && ggml_backend_buffer_is_host(buf)) {
+            total_host += ggml_backend_buffer_get_size(buf);
+        }
+    }
+    if (total_host == 0) {
+        return;
+    }
+
+    const size_t extra_needed = total_host * (size_t) (n_nodes - 1); // node 0 reuses the original
+    const size_t avail = llama_get_available_ram_bytes();
+    LLAMA_LOG_INFO("%s: NUMA mirror: %d nodes, host weights %.2f GiB; need +%.2f GiB for mirrors (%.2f GiB available)\n",
+            __func__, n_nodes, total_host/1073741824.0, extra_needed/1073741824.0, avail/1073741824.0);
+    if (avail > 0 && extra_needed + (2ull << 30) > avail) {
+        LLAMA_LOG_WARN("%s: NUMA mirror: insufficient free RAM to duplicate weights across %d nodes; "
+                "continuing WITHOUT weight mirroring\n", __func__, n_nodes);
+        return;
+    }
+
+    // allocate per-node copies of each host weight buffer
+    for (auto buf : model.bufs) {
+        if (!buf || !ggml_backend_buffer_is_host(buf)) {
+            continue;
+        }
+        llama_model::numa_mirror_buffer mb;
+        mb.buf  = buf;
+        mb.size = ggml_backend_buffer_get_size(buf);
+        void * base = ggml_backend_buffer_get_base(buf);
+        for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+            mb.node_base[n] = NULL;
+        }
+        mb.node_base[0] = base;                 // node 0 aliases the original buffer ...
+        ggml_numa_bind(base, mb.size, 0);       // ... migrated onto node 0 (best effort)
+        bool ok = true;
+        for (int n = 1; n < n_nodes; ++n) {
+            void * p = ggml_numa_alloc(mb.size, n);
+            if (!p) { ok = false; break; }
+            // parallel copy with threads pinned to node n (MPOL_BIND places the faulted pages there)
+            ggml_numa_memcpy_to_node(p, base, mb.size, n);
+            mb.node_base[n] = p;
+        }
+        if (!ok) {
+            for (int n = 1; n < n_nodes; ++n) {
+                ggml_numa_free(mb.node_base[n], mb.size);
+            }
+            for (auto & done : model.numa_mirror_bufs) {
+                for (int n = 1; n < n_nodes; ++n) {
+                    ggml_numa_free(done.node_base[n], done.size);
+                }
+            }
+            model.numa_mirror_bufs.clear();
+            LLAMA_LOG_WARN("%s: NUMA mirror: allocation failed; continuing WITHOUT weight mirroring\n", __func__);
+            return;
+        }
+        model.numa_mirror_bufs.push_back(mb);
+    }
+
+    // point every (non-view) host weight tensor at its per-node copies
+    int n_mirrored = 0;
+    for (struct ggml_context * ctx : model.ctxs) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const llama_model::numa_mirror_buffer * mb = nullptr;
+            for (auto & cand : model.numa_mirror_bufs) {
+                if (cand.buf == t->buffer) { mb = &cand; break; }
+            }
+            if (!mb) {
+                continue;
+            }
+            const size_t offset = (const char *) t->data - (const char *) mb->node_base[0];
+            void * node_data[GGML_NUMA_MAX_NODES];
+            for (int n = 0; n < n_nodes; ++n) {
+                node_data[n] = (char *) mb->node_base[n] + offset;
+            }
+            ggml_numa_tensor_set_mirror(t, node_data);
+            ++n_mirrored;
+        }
+    }
+    LLAMA_LOG_INFO("%s: NUMA mirror: duplicated %d weight tensors across %d nodes\n",
+            __func__, n_mirrored, n_nodes);
+}
+
+// Duplicate the KV cache buffers once per NUMA node and point each k_l/v_l tensor at its per-node
+// copies. The copies start zeroed (matching the just-cleared cache); subsequent writes are fanned
+// out to every node by ggml_numa_replicate_kv_write, and reads are redirected per thread.
+static void llama_mirror_kv_cache(struct llama_kv_cache & cache) {
+    if (!ggml_numa_mirror_active() || !(ggml_numa_get_mirror() & GGML_NUMA_MIRROR_KV)) {
+        return;
+    }
+    if (!cache.numa_mirror_bufs.empty()) {
+        return; // already mirrored
+    }
+    const int n_nodes = ggml_numa_node_count();
+    if (n_nodes < 2) {
+        return;
+    }
+
+    size_t total = 0;
+    for (auto buf : cache.bufs) {
+        if (buf && ggml_backend_buffer_is_host(buf)) {
+            total += ggml_backend_buffer_get_size(buf);
+        }
+    }
+    if (total == 0) {
+        return;
+    }
+
+    const size_t extra = total * (size_t) (n_nodes - 1);
+    const size_t avail = llama_get_available_ram_bytes();
+    LLAMA_LOG_INFO("%s: NUMA mirror: KV cache %.2f GiB; +%.2f GiB for %d-node mirror (%.2f GiB available)\n",
+            __func__, total/1073741824.0, extra/1073741824.0, n_nodes, avail/1073741824.0);
+    if (avail > 0 && extra + (2ull << 30) > avail) {
+        LLAMA_LOG_WARN("%s: NUMA mirror: insufficient RAM to mirror the KV cache; continuing WITHOUT KV mirror\n", __func__);
+        return;
+    }
+
+    for (auto buf : cache.bufs) {
+        if (!buf || !ggml_backend_buffer_is_host(buf)) {
+            continue;
+        }
+        llama_kv_cache::numa_mirror_buffer mb;
+        mb.buf  = buf;
+        mb.size = ggml_backend_buffer_get_size(buf);
+        void * base = ggml_backend_buffer_get_base(buf);
+        for (int n = 0; n < GGML_NUMA_MAX_NODES; ++n) {
+            mb.node_base[n] = NULL;
+        }
+        mb.node_base[0] = base;            // node 0 aliases the original (cleared) buffer
+        ggml_numa_bind(base, mb.size, 0);  // best-effort migrate it onto node 0
+        bool ok = true;
+        for (int n = 1; n < n_nodes; ++n) {
+            void * p = ggml_numa_alloc(mb.size, n);
+            if (!p) { ok = false; break; }
+            // copy the (just-cleared) buffer to fault the pages now, placing them node-locally and
+            // making the allocation count against MemAvailable; otherwise the weight-mirror RAM
+            // check can't see this reservation and combined over-subscription would surface as a
+            // mid-decode SIGBUS instead of here.
+            ggml_numa_memcpy_to_node(p, base, mb.size, n);
+            mb.node_base[n] = p;
+        }
+        if (!ok) {
+            for (int n = 1; n < n_nodes; ++n) {
+                ggml_numa_free(mb.node_base[n], mb.size);
+            }
+            for (auto & done : cache.numa_mirror_bufs) {
+                for (int n = 1; n < n_nodes; ++n) {
+                    ggml_numa_free(done.node_base[n], done.size);
+                }
+            }
+            cache.numa_mirror_bufs.clear();
+            LLAMA_LOG_WARN("%s: NUMA mirror: KV allocation failed; continuing WITHOUT KV mirror\n", __func__);
+            return;
+        }
+        cache.numa_mirror_bufs.push_back(mb);
+    }
+
+    int n_mirrored = 0;
+    for (struct ggml_context * ctx : cache.ctxs) {
+        for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            const llama_kv_cache::numa_mirror_buffer * mb = nullptr;
+            for (auto & cand : cache.numa_mirror_bufs) {
+                if (cand.buf == t->buffer) { mb = &cand; break; }
+            }
+            if (!mb) {
+                continue;
+            }
+            const size_t off = (const char *) t->data - (const char *) mb->node_base[0];
+            void * node_data[GGML_NUMA_MAX_NODES];
+            for (int n = 0; n < n_nodes; ++n) {
+                node_data[n] = (char *) mb->node_base[n] + off;
+            }
+            ggml_numa_tensor_set_mirror(t, node_data);
+            ++n_mirrored;
+        }
+    }
+    LLAMA_LOG_INFO("%s: NUMA mirror: mirrored %d KV tensors across %d nodes\n", __func__, n_mirrored, n_nodes);
 }
 
 static void llama_repack_up_gate_exps(llama_context & lctx) {
@@ -9080,6 +9525,9 @@ struct llama_context * llama_init_from_model(
 
             llama_repack_up_gate_exps(*ctx);
 
+            // NUMA mirror: duplicate the (now final) weights per node before building graphs
+            llama_mirror_model_weights(ctx->model);
+
             // build worst-case graph
             int n_past = cparams.n_ctx - n_tokens;
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
@@ -9115,6 +9563,12 @@ struct llama_context * llama_init_from_model(
                             ggml_backend_buft_name(buft),
                             size / 1024.0 / 1024.0);
                 }
+            }
+
+            if (ggml_numa_get_bind_compute()) {
+                size_t bound = ggml_backend_sched_numa_bind_cpu_buffers(ctx->sched, ggml_numa_get_primary_gpu_node());
+                LLAMA_LOG_INFO("%s: bound %.2f MiB of CPU compute buffers to NUMA node %d\n", __func__,
+                        bound / 1024.0 / 1024.0, ggml_numa_get_primary_gpu_node());
             }
 
             // note: the number of splits during measure is higher than during inference due to the kv shift
@@ -11269,6 +11723,17 @@ struct llama_data_read {
             }
         }
 
+        // NUMA mirror: restore wrote node 0's KV copies directly (ggml_backend_tensor_set / split
+        // memcpy), bypassing graph-CPY replication — re-sync the other node copies so attention on
+        // node>0 reads the restored K/V, not stale/zero data. No-op when not mirroring.
+        // NOTE: kv_self.kr_l (DSA indexer cache, added upstream) is not mirrored today; if it
+        // ever joins llama_mirror_kv_cache, add a resync loop for it here too.
+        if (!kv_self.numa_mirror_bufs.empty()) {
+            for (auto * t : kv_self.k_l) ggml_numa_tensor_resync(t);
+            for (auto * t : kv_self.v_l) ggml_numa_tensor_resync(t);
+            for (auto * t : kv_self.s_l) ggml_numa_tensor_resync(t);
+        }
+
         // the pooled block keys are derived from the indexer keys restored just above, and the
         // builder rebuilds only the blocks an ubatch writes into, so the next graph must pool
         // every block once
@@ -13403,6 +13868,10 @@ void llama_print_timings(struct llama_context * ctx) {
     LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, timings.t_eval_ms, timings.n_eval, timings.t_eval_ms / timings.n_eval, 1e3 / timings.t_eval_ms * timings.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (timings.t_end_ms - timings.t_start_ms), (timings.n_p_eval + timings.n_eval));
+
+    if (ggml_numa_stats_level() >= 2) {
+        ggml_numa_stats_print(); // GGML_NUMA_STATS=2: per-phase counter window, dump + reset
+    }
 }
 
 void llama_reset_timings(struct llama_context * ctx) {

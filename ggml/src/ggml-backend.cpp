@@ -2833,6 +2833,24 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
+size_t ggml_backend_sched_numa_bind_cpu_buffers(ggml_backend_sched_t sched, int node) {
+    size_t bound = 0;
+    const int n = ggml_gallocr_get_n_buffers(sched->galloc);
+    for (int i = 0; i < n; i++) {
+        ggml_backend_buffer_t buf = ggml_gallocr_get_buffer(sched->galloc, i);
+        if (buf == NULL || ggml_backend_buffer_get_type(buf) != ggml_backend_cpu_buffer_type()) {
+            continue;
+        }
+        void * base = ggml_backend_buffer_get_base(buf);
+        size_t size = ggml_backend_buffer_get_size(buf);
+        if (base != NULL && size > 0) {
+            ggml_numa_bind(base, size, node);
+            bound += size;
+        }
+    }
+    return bound;
+}
+
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);

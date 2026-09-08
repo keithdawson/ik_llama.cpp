@@ -2281,7 +2281,50 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
         else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
         else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+        else if (value == "mirror") { params.numa = GGML_NUMA_STRATEGY_MIRROR; }
         else { invalid_param = true; }
+        return true;
+    }
+    if (arg == "--numa-mirror") {
+        CHECK_ARG
+        std::string value(argv[i]);
+        params.numa = GGML_NUMA_STRATEGY_MIRROR; // selecting components implies mirror mode
+        uint32_t mask = 0;
+        std::stringstream ss(value);
+        std::string item;
+        bool ok = true;
+        while (std::getline(ss, item, ',')) {
+            /**/ if (item == "all")         { mask |= GGML_NUMA_MIRROR_ALL; }
+            else if (item == "none")        { mask  = 0; }
+            else if (item == "weights")     { mask |= GGML_NUMA_MIRROR_WEIGHTS; }
+            else if (item == "kv")          { mask |= GGML_NUMA_MIRROR_KV; }
+            else if (item == "dense")       { mask |= GGML_NUMA_MIRROR_DENSE; }
+            else { ok = false; }
+        }
+        if (!ok) { invalid_param = true; return true; }
+        params.numa_mirror = mask;
+        return true;
+    }
+    if (arg == "--numa-gpu-node") {
+        if (++i >= argc) {
+            invalid_param = true;
+            return true;
+        }
+        params.numa_gpu_node = std::stoi(argv[i]);
+        return true;
+    }
+    if (arg == "--numa-bind-compute") {
+        params.numa_bind_compute = true;
+        return true;
+    }
+    if (arg == "--numa-exclude-cpus") {
+        CHECK_ARG
+        params.numa_exclude_cpus = argv[i];
+#ifdef _WIN32
+        _putenv_s("GGML_NUMA_EXCLUDE_CPUS", params.numa_exclude_cpus.c_str());
+#else
+        setenv("GGML_NUMA_EXCLUDE_CPUS", params.numa_exclude_cpus.c_str(), 1);
+#endif
         return true;
     }
     if (arg == "-dev" || arg == "--device") {
@@ -3322,8 +3365,22 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                                         "  - distribute: spread execution evenly over all nodes\n"
                                                                         "  - isolate: only spawn threads on CPUs on the node that execution started on\n"
                                                                         "  - numactl: use the CPU map provided by numactl\n"
+                                                                        "  - mirror: duplicate model weights/KV per NUMA node so each node reads only local memory.\n"
+                                                                        "            pins threads per node and uses N x RAM (N = number of NUMA nodes). implies --no-mmap.\n"
                                                                         "if run without this previously, it is recommended to drop the system page cache before using this\n"
                                                                         "see https://github.com/ggerganov/llama.cpp/issues/1437" });
+    options.push_back({ "*",           "       --numa-mirror LIST",     "comma list selecting what to mirror with --numa mirror:\n"
+                                                                        "  weights, kv, dense, all, none (default: all). implies --numa mirror\n"
+                                                                        "  'dense' mirrors every weight EXCEPT the routed experts, which get one\n"
+                                                                        "  copy pinned to an owner node (expert-affinity sharding). Use for MoE\n"
+                                                                        "  models too large to duplicate: footprint is dense*nodes + experts*1" });
+    options.push_back({ "*",           "       --numa-gpu-node N",      "with --numa mirror, bind non-mirrored host buffers to the NUMA node the GPU\n"
+                                                                        "is attached to (memory placement only; compute uses all nodes)" });
+    options.push_back({ "*",           "       --numa-bind-compute",    "with --numa-gpu-node, also bind the CPU compute buffers (data the GPU\n"
+                                                                        "transfers from/to) to that node. A/B test: makes GPU DMA node-local at the\n"
+                                                                        "cost of remote writes from expert threads on other nodes" });
+    options.push_back({ "*",           "       --numa-exclude-cpus LIST", "comma-separated list of CPUs or ranges to exclude from thread pinning\n"
+                                                                          "  (e.g., '0,1,2-4'). completely removes them from the NUMA node tracking" });
 
     if (llama_supports_gpu_offload()) {
         options.push_back({ "*",           "-ngl,  --gpu-layers N",
@@ -4046,6 +4103,38 @@ std::string fs_get_cache_file(const std::string & filename) {
 
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
+
+    // apply any --numa-mirror component customization before the model / context are built
+    // (ggml_numa_init already defaulted this to "all" when --numa mirror was selected).
+    if (params.numa == GGML_NUMA_STRATEGY_MIRROR) {
+        ggml_numa_set_mirror(params.numa_mirror);
+        if (params.numa_gpu_node >= 0) {
+            ggml_numa_set_primary_gpu_node(params.numa_gpu_node);
+        }
+        if (params.numa_bind_compute) {
+            ggml_numa_set_bind_compute(true);
+        }
+#if defined(__gnu_linux__)
+        // With GPU offload, mirror-pinned OpenMP workers must yield while the GPU runs:
+        // spin-waiting on every core starves the CUDA driver thread (measured -12% pp /
+        // -5% tg vs no-numa). Fully passive waiting fixes TG but makes every CPU expert
+        // segment pay thread-wake latency (~-10% pp). The sweet spot is a short spin
+        // before sleeping. 7000 is the measured optimum on the dual-EPYC target (a
+        // desktop Zen 5 preferred 25000; more cores -> shorter spin wins, since idle
+        // spinners cost more when there are 190 of them). Re-tune per machine with
+        // scripts/tune-spincount.sh. GOMP_SPINCOUNT overrides the wait policy's spin
+        // count in libgomp; PASSIVE alone is the fallback for other OpenMP runtimes.
+        // Defaults only: if the user set either variable, respect their configuration
+        // entirely. Safe here because no OpenMP region has run yet, so the runtime
+        // hasn't latched its config.
+        if (params.n_gpu_layers > 0 &&
+            getenv("OMP_WAIT_POLICY") == nullptr && getenv("GOMP_SPINCOUNT") == nullptr) {
+            setenv("OMP_WAIT_POLICY", "PASSIVE", 0);
+            setenv("GOMP_SPINCOUNT", "7000", 0);
+            fprintf(stderr, "%s: NUMA mirror + GPU offload: defaulting OMP_WAIT_POLICY=PASSIVE, GOMP_SPINCOUNT=7000\n", __func__);
+        }
+#endif
+    }
 
     auto mparams = common_model_params_to_llama(params);
 

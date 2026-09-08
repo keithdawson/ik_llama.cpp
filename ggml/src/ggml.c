@@ -41,9 +41,18 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <sys/mman.h> // mmap/munmap/madvise for NUMA mirror allocation
+#include <unistd.h>   // sysconf(_SC_PAGESIZE)
 #endif
 
 #define IK_PRINT_TIMING 0
+
+// portable thread-local storage class (GCC/Clang use __thread, MSVC C uses __declspec(thread))
+#if defined(_MSC_VER)
+#define GGML_THREAD_LOCAL __declspec(thread)
+#else
+#define GGML_THREAD_LOCAL __thread
+#endif
 
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -4636,7 +4645,7 @@ static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size 
 // NUMA support
 //
 
-#define GGML_NUMA_MAX_NODES 8
+// GGML_NUMA_MAX_NODES is defined in ggml.h
 #define GGML_NUMA_MAX_CPUS 512
 
 struct ggml_numa_node {
@@ -4646,10 +4655,16 @@ struct ggml_numa_node {
 
 struct ggml_numa_nodes {
     enum ggml_numa_strategy numa_strategy;
+    uint32_t mirror_flags; // ggml_numa_mirror_flags: what to duplicate per node when strategy == MIRROR
     struct ggml_numa_node nodes[GGML_NUMA_MAX_NODES];
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
+    int32_t primary_gpu_node; // -1 if not set, else the preferred node for dense GPU interaction
+    bool bind_compute; // when primary_gpu_node is set: also bind the sched CPU compute buffers to it
+    bool pin_cpu; // GGML_NUMA_PIN=cpu: pin each mirror thread to one specific CPU (CCD/L3 locality)
+    bool fake; // GGML_NUMA_FAKE=N testbed mode: fabricated topology on a 1-node box, mbind disabled
+    double throttle_gbps; // GGML_NUMA_XGMI_GBPS: cap explicit cross-node copies to model the interconnect (0 = off)
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -4678,6 +4693,327 @@ inline static void ggml_critical_section_start(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NUMA-aware hierarchical barrier
+//
+// The default flat barrier has every thread hammer a single shared cache line. On a
+// multi-socket box that line ping-pongs across the interconnect on every op, and profiling
+// shows it consuming ~half of all cycles during token generation with 48 cross-socket threads.
+// When NUMA mirroring is active (threads pinned per node), this 2-level barrier instead syncs
+// threads within a node on a *node-local* line, then has one leader per node do a small
+// cross-node sync — cutting cross-socket contention from O(threads) to O(nodes).
+// ---------------------------------------------------------------------------
+#define GGML_NUMA_BARRIER_LINE 64
+struct ggml_numa_barrier_node {
+    atomic_int arrive;
+    char pad0[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
+    atomic_int release;
+    char pad1[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
+};
+
+static struct {
+    struct ggml_numa_barrier_node * node[GGML_NUMA_MAX_NODES]; // node[k] lives in node-k memory
+    atomic_int global_arrive;
+    char pad[GGML_NUMA_BARRIER_LINE];
+    atomic_int global_release;
+    int node_nth[GGML_NUMA_MAX_NODES];
+    int n_leaders;
+    int active;
+} g_numa_barrier;
+
+static GGML_THREAD_LOCAL int tl_numa_node = 0; // this thread's NUMA node (set in set_numa_thread_affinity)
+
+// ---------------------------------------------------------------------------
+// NUMA-mirror diagnostics (GGML_NUMA_STATS=1|2). Relaxed counters over the mirror
+// paths so a testbed run can attribute traffic: node-local vs fallback pointer
+// resolutions, bytes moved by explicit cross-node copies, barrier flavor counts,
+// and time spent in the GGML_NUMA_XGMI_GBPS pacing (see ggml_numa_paced_wait).
+// Off by default; the hot paths pay one never-taken branch on a cached global.
+// ---------------------------------------------------------------------------
+static int g_numa_stats_level = 0; // 0=off, 1=dump at exit, 2=also dump+reset per llama_print_timings
+
+// GGML_NUMA_NT_COPY=1: use non-temporal stores in the explicit cross-node copies so populating
+// a multi-GiB mirror streams at DRAM write bandwidth instead of evicting the entire L3 (E5)
+static bool g_numa_nt_copy = false;
+static int  g_numa_shard_sched = 1; // GGML_NUMA_SHARD_SCHED=0 disables node-aware MoE scheduling
+
+// GGML_NUMA_HIER_BATCH_MAX: batches larger than this use the flat barrier, smaller ones the
+// NUMA-hierarchical barrier when it's active. 32 matches the original hardcoded gate; negative
+// values mean "always hierarchical" (E3 sweep knob)
+static int g_numa_hier_batch_max = 32;
+
+// GGML_NUMA_HUGETLB=1: back ggml_numa_alloc with explicit 2 MiB hugetlb pages instead of
+// relying on THP (requires a preallocated vm.nr_hugepages pool; falls back per-allocation)
+static bool g_numa_hugetlb = false;
+
+// GGML_NUMA_COPY_THREADS / GGML_NUMA_COPY_MIN_MB: tune the dest-pinned parallel mirror copy
+// (defaults match the historical 16-thread / 64 MiB threshold)
+#define GGML_NUMA_COPY_MIN_PARALLEL (64u << 20) // below this a single memcpy wins
+#define GGML_NUMA_COPY_MAX_THREADS  16
+static int    g_numa_copy_threads = GGML_NUMA_COPY_MAX_THREADS;
+static size_t g_numa_copy_min     = GGML_NUMA_COPY_MIN_PARALLEL;
+
+#if defined(__gnu_linux__)
+// MoE expert-access census (GGML_NUMA_STATS): per-expert routed-row totals, aggregated over
+// all mul_mat_id ops. Written only by ith==0 inside each op (ops run sequentially), so plain
+// integers are safe. Answers whether expert *sharding* per node could replace mirroring.
+#define GGML_NUMA_MOE_MAX_EXPERTS 512
+static struct {
+    uint64_t rows[GGML_NUMA_MOE_MAX_EXPERTS];
+    uint64_t ops;
+    int      n_expert;
+    // per-op node-imbalance of the owner(e) = e % n_nodes split used by expert sharding.
+    // Cumulative per-node totals average out over a run and hide the real cost: every op ends
+    // at a barrier, so each op is gated by its busiest node. This tracks that per op.
+    uint64_t skew_ops;
+    double   skew_sum; // sum of per-op (max node rows / mean node rows)
+    double   skew_max; // worst single op
+    uint64_t moves;    // experts relocated off their owner node by the rebalancer
+    uint64_t after_ops; // ops the rebalancer scored
+    double   after_sum; // sum of per-op post-assignment skew (remote penalty included)
+} g_numa_moe_stats;
+
+static void ggml_numa_moe_stats_add(int n_as, const int64_t * counts) {
+    if (n_as > GGML_NUMA_MOE_MAX_EXPERTS) {
+        n_as = GGML_NUMA_MOE_MAX_EXPERTS;
+    }
+    if (n_as > g_numa_moe_stats.n_expert) {
+        g_numa_moe_stats.n_expert = n_as;
+    }
+    g_numa_moe_stats.ops++;
+    for (int a = 0; a < n_as; ++a) {
+        g_numa_moe_stats.rows[a] += (uint64_t) counts[a];
+    }
+
+    // Work for expert a is proportional to its routed row count, so per-node work is the row
+    // sum over the experts that node owns. Computed whether or not sharding is enabled, so a
+    // plain mirror run can predict what sharding would cost on this model.
+    const int n_nodes = (int) g_state.numa.n_nodes;
+    if (n_nodes > 1) {
+        uint64_t per_node[GGML_NUMA_MAX_NODES] = {0};
+        uint64_t total = 0;
+        for (int a = 0; a < n_as; ++a) {
+            per_node[a % n_nodes] += (uint64_t) counts[a];
+            total                 += (uint64_t) counts[a];
+        }
+        if (total > 0) {
+            uint64_t mx = 0;
+            for (int k = 0; k < n_nodes; ++k) {
+                if (per_node[k] > mx) mx = per_node[k];
+            }
+            const double skew = (double) mx / ((double) total / n_nodes);
+            g_numa_moe_stats.skew_sum += skew;
+            g_numa_moe_stats.skew_ops++;
+            if (skew > g_numa_moe_stats.skew_max) {
+                g_numa_moe_stats.skew_max = skew;
+            }
+        }
+    }
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// Cost-aware expert -> node assignment (stage 2b: rebalancing).
+//
+// owner(e) = e % n_nodes is perfectly local but not balanced: with GLM-5.2's top-8 of 256,
+// a token's active experts land 5/3 or worse across two nodes about as often as 4/4, and the
+// op cannot finish until the heavier node does. Measured mean skew 1.25-1.32.
+//
+// Rather than steal opportunistically (which needs atomics and makes the row split
+// nondeterministic), every thread derives the SAME assignment from matrix_row_counts, which is
+// already filled by ith==0 and published by the barrier before the expert loop. Deterministic
+// in, deterministic out: each expert is still computed in full by one node's threads, so output
+// stays bit-identical -- only which node does it can change.
+//
+// Moving expert e off its owner makes its weight reads remote, so a move only pays when the
+// heavier node sheds more than the lighter node takes on. steal_cost is that penalty ratio r
+// (GGML_NUMA_SHARD_STEAL_COST); at r >= 2 a one-expert move from a 5/3 split is already
+// break-even, which is why the default is conservative and the knob is off until measured.
+// ---------------------------------------------------------------------------
+#define GGML_NUMA_MOE_MAX_ASSIGN 1024
+static int    g_numa_expert_node[GGML_NUMA_MOE_MAX_ASSIGN]; // written by ith==0, read after the barrier
+static int    g_numa_expert_assigned = 0;                   // n_as the table is valid for (0 = use owner())
+static int    g_numa_shard_steal = 0;                       // GGML_NUMA_SHARD_STEAL
+static double g_numa_steal_cost  = 1.5;                     // GGML_NUMA_SHARD_STEAL_COST
+
+static int ggml_numa_node_first_thread(int k, int nth); // defined below, with the pinning code
+
+// Rows expert a adds to node's queue: its own rows, inflated by the remote penalty when node is
+// not a's owner (its weights live on the owner, so anyone else streams them across the link).
+static inline double ggml_numa_expert_cost(int a, int node, int n_nodes, const int64_t * counts) {
+    const double w = (double) counts[a];
+    return (a % n_nodes) == node ? w : w * g_numa_steal_cost;
+}
+
+// Called by ith==0 only, before the barrier that publishes matrix_row_counts.
+//
+// Works in *time* units, not row counts: a node's finishing time is its queued rows divided by
+// how many threads it has. That only matters when nodes are asymmetric -- after
+// GGML_NUMA_RESERVE_CPUS, or on a topology with uneven CPUs per node -- where equal rows are not
+// equal time and comparing raw rows would move work onto the node least able to absorb it. With
+// symmetric nodes every term scales by the same constant and this is identical to comparing rows.
+static void ggml_numa_moe_assign(int n_as, const int64_t * counts, int n_nodes, int nth) {
+    g_numa_expert_assigned = 0;
+    if (!g_numa_shard_steal || n_nodes < 2 || n_as > GGML_NUMA_MOE_MAX_ASSIGN) {
+        return; // fall back to the pure owner() rule
+    }
+
+    double rows[GGML_NUMA_MAX_NODES] = {0};
+    double cap [GGML_NUMA_MAX_NODES];
+    int    active[GGML_NUMA_MOE_MAX_ASSIGN];
+    int    n_active = 0;
+    for (int k = 0; k < n_nodes; ++k) {
+        const int lo_t = ggml_numa_node_first_thread(k,     nth);
+        const int hi_t = ggml_numa_node_first_thread(k + 1, nth);
+        cap[k] = (double) (hi_t > lo_t ? hi_t - lo_t : 1); // a node with no threads of its own
+    }                                                     // never wins the "lightest" slot anyway
+    for (int a = 0; a < n_as; ++a) {
+        const int owner = a % n_nodes;
+        g_numa_expert_node[a] = owner;
+        if (counts[a] > 0) {
+            rows[owner] += (double) counts[a];
+            active[n_active++] = a;
+        }
+    }
+    g_numa_expert_assigned = n_as;
+    if (n_active <= 1) {
+        return;
+    }
+
+    // Greedy: while some expert can be moved off the slowest-finishing node such that the
+    // predicted makespan max(rows/cap) strictly drops, move the best one. Bounded by n_active
+    // moves and in practice ends after one or two -- at top-8 there is not much to fix.
+    for (int iter = 0; iter < n_active; ++iter) {
+        int hi = 0, lo = 0;
+        for (int k = 1; k < n_nodes; ++k) {
+            if (rows[k]/cap[k] > rows[hi]/cap[hi]) hi = k;
+            if (rows[k]/cap[k] < rows[lo]/cap[lo]) lo = k;
+        }
+        if (hi == lo) {
+            break;
+        }
+        int    best     = -1;
+        double best_max = rows[hi]/cap[hi]; // must strictly improve on doing nothing
+        for (int i = 0; i < n_active; ++i) {
+            const int a = active[i];
+            if (g_numa_expert_node[a] != hi) {
+                continue;
+            }
+            const double nh = (rows[hi] - ggml_numa_expert_cost(a, hi, n_nodes, counts)) / cap[hi];
+            const double nl = (rows[lo] + ggml_numa_expert_cost(a, lo, n_nodes, counts)) / cap[lo];
+            const double mx = nh > nl ? nh : nl;
+            if (mx < best_max - 1e-9) {
+                best_max = mx;
+                best     = a;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        rows[hi] -= ggml_numa_expert_cost(best, hi, n_nodes, counts);
+        rows[lo] += ggml_numa_expert_cost(best, lo, n_nodes, counts);
+        g_numa_expert_node[best] = lo;
+#if defined(__gnu_linux__)
+        g_numa_moe_stats.moves++; // ith==0 only, ops run sequentially -- same safety as the census
+#endif
+    }
+
+#if defined(__gnu_linux__)
+    // Residual imbalance the op will actually run at, remote penalties included. Paired with
+    // moe_node_skew_mean (which always scores the untouched owner() split) this reads as
+    // before -> after, so the rebalancer's effect is visible rather than inferred.
+    if (g_numa_stats_level) {
+        double tot = 0.0, mx = 0.0;
+        for (int k = 0; k < n_nodes; ++k) {
+            const double t = rows[k]/cap[k];
+            tot += t;
+            if (t > mx) mx = t;
+        }
+        if (tot > 0.0) {
+            g_numa_moe_stats.after_sum += mx / (tot / n_nodes);
+            g_numa_moe_stats.after_ops++;
+        }
+    }
+#endif
+}
+
+#if defined(__gnu_linux__)
+struct ggml_numa_stats_node {
+    atomic_ullong resolve_hit;      // ggml_numa_tensor_data served this node's mirror copy
+    atomic_ullong resolve_fallback; // mirrored tensor lacked this node's copy -> used t->data
+    atomic_ullong moe_experts;      // expert matmuls this node computed (expert sharding balance)
+    char pad[GGML_NUMA_BARRIER_LINE - 3*sizeof(atomic_ullong)];
+};
+
+static struct {
+    struct ggml_numa_stats_node node[GGML_NUMA_MAX_NODES];
+    atomic_ullong populate_bytes;    // all ggml_numa_memcpy_to_node traffic (mirror load + resync)
+    atomic_ullong populate_calls;
+    atomic_ullong populate_us;       // wall time inside ggml_numa_memcpy_to_node (copy only, no disk I/O)
+    atomic_ullong resync_bytes;      // subset of populate_*: ggml_numa_tensor_resync traffic
+    atomic_ullong resync_calls;
+    atomic_ullong kv_repl_bytes;     // per-token KV fan-out in ggml_numa_replicate_kv_write
+    atomic_ullong kv_repl_calls;
+    atomic_ullong barriers_hier;     // hierarchical barrier passes (counted by the global leader)
+    atomic_ullong barriers_flat;     // flat ggml_barrier_impl passes (counted by the last arriver)
+    atomic_ullong throttle_sleep_us; // time spent modeling the interconnect (paced waits)
+} g_numa_stats;
+
+#define GGML_NUMA_STAT_ADD(field, v) atomic_fetch_add_explicit(&g_numa_stats.field, (unsigned long long)(v), memory_order_relaxed)
+#endif
+
+static inline void ggml_numa_spin_pause(void) {
+#if defined(__SSE3__)
+    _mm_pause();
+#elif defined __ARM_NEON
+    __asm__ __volatile__("isb\n");
+#endif
+}
+
+static void ggml_numa_hier_barrier(void) {
+    const int node    = tl_numa_node;
+    const int node_nth = g_numa_barrier.node_nth[node];
+
+    // ---- intra-node level (node-local cache line) ----
+    if (node_nth > 1) {
+        struct ggml_numa_barrier_node * nb = g_numa_barrier.node[node];
+        const int rel_old = atomic_load(&nb->release);
+        if (atomic_fetch_add(&nb->arrive, 1) != node_nth - 1) {
+            // follower: wait for this node's leader to release us
+            while (atomic_load(&nb->release) == rel_old) {
+                ggml_numa_spin_pause();
+            }
+            return;
+        }
+        // last arriver on this node becomes the leader
+        atomic_store(&nb->arrive, 0);
+    }
+
+    // ---- cross-node level (only one leader per node participates) ----
+    const int n_leaders = g_numa_barrier.n_leaders;
+    if (n_leaders > 1) {
+        const int g_old = atomic_load(&g_numa_barrier.global_release);
+        if (atomic_fetch_add(&g_numa_barrier.global_arrive, 1) == n_leaders - 1) {
+            atomic_store(&g_numa_barrier.global_arrive, 0);
+            atomic_fetch_add(&g_numa_barrier.global_release, 1); // release all leaders
+#if defined(__gnu_linux__)
+            if (g_numa_stats_level) {
+                GGML_NUMA_STAT_ADD(barriers_hier, 1);
+            }
+#endif
+        } else {
+            while (atomic_load(&g_numa_barrier.global_release) == g_old) {
+                ggml_numa_spin_pause();
+            }
+        }
+    }
+
+    // release this node's followers
+    if (node_nth > 1) {
+        atomic_fetch_add(&g_numa_barrier.node[node]->release, 1);
+    }
+}
+
 static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
@@ -4693,6 +5029,11 @@ static inline void ggml_barrier_impl(struct ggml_compute_state_shared * shared) 
         // last thread
         atomic_store(n_barrier, 0);
         atomic_fetch_add(n_barrier_passed, 1);
+#if defined(__gnu_linux__)
+        if (g_numa_stats_level) {
+            GGML_NUMA_STAT_ADD(barriers_flat, 1);
+        }
+#endif
     } else {
         // wait for other threads
         const int n_spin_before_sleep = 100000;
@@ -4717,14 +5058,30 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
-    if (shared && shared->n_batch > 32) {
+    // prompt processing (large batch) is compute-bound; keep its original barrier. Only token
+    // generation (small batch) was barrier-bound, so that's the only path the hierarchical
+    // barrier replaces — applying it to PP just adds 2-level latency with no contention to save.
+    // GGML_NUMA_HIER_BATCH_MAX moves the crossover (negative = hierarchical for all batches).
+    if (shared && g_numa_hier_batch_max >= 0 && shared->n_batch > g_numa_hier_batch_max) {
         ggml_barrier_impl(shared);
+        return;
+    }
+    if (g_numa_barrier.active) {
+        ggml_numa_hier_barrier();
         return;
     }
     #pragma omp barrier
 }
 #else
 static void ggml_barrier(struct ggml_compute_state_shared * shared) {
+    if (shared->n_threads == 1) {
+        return;
+    }
+    if (g_numa_barrier.active &&
+        !(shared && g_numa_hier_batch_max >= 0 && shared->n_batch > g_numa_hier_batch_max)) {
+        ggml_numa_hier_barrier();
+        return;
+    }
     ggml_barrier_impl(shared);
 }
 #endif
@@ -4765,19 +5122,43 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     // set numa scheme
     g_state.numa.numa_strategy = numa_flag;
 
+    // default to mirroring everything; the caller may narrow this via ggml_numa_set_mirror()
+    if (numa_flag == GGML_NUMA_STRATEGY_MIRROR && g_state.numa.mirror_flags == 0) {
+        g_state.numa.mirror_flags = GGML_NUMA_MIRROR_ALL;
+    }
+
     GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
 
     g_state.numa.cpuset = ggml_get_numa_affinity();
 
-    // enumerate nodes
-    while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
-        rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
-        GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-        if (stat(path, &st) != 0) { break; }
-        ++g_state.numa.n_nodes;
+    // GGML_NUMA_FAKE=<N>: testbed mode. Fabricate an N-node topology from the CPUs this
+    // process is allowed on (e.g. a docker --cpuset-cpus slice) so the full mirror stack —
+    // per-node copies, thread pinning, hierarchical barrier, KV replication — can be
+    // exercised on a single-node machine. Memory binding is a no-op (see ggml_sys_mbind).
+    uint32_t fake_nodes = 0;
+    {
+        const char * s = getenv("GGML_NUMA_FAKE");
+        if (s && *s) {
+            long v = strtol(s, NULL, 10);
+            if (v >= 2 && v <= GGML_NUMA_MAX_NODES) {
+                fake_nodes = (uint32_t) v;
+            } else if (v != 0) {
+                fprintf(stderr, "%s: ignoring GGML_NUMA_FAKE=%s (want 2..%d)\n", __func__, s, GGML_NUMA_MAX_NODES);
+            }
+        }
     }
 
-    // enumerate CPUs
+    // enumerate nodes
+    if (fake_nodes == 0) {
+        while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
+            rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
+            GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+            if (stat(path, &st) != 0) { break; }
+            ++g_state.numa.n_nodes;
+        }
+    }
+
+    // enumerate CPUs (always the real count: it sizes CPU_ALLOC_SIZE in the pinning code)
     while (g_state.numa.total_cpus < GGML_NUMA_MAX_CPUS) {
         rv = snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u", g_state.numa.total_cpus);
         GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
@@ -4785,7 +5166,48 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         ++g_state.numa.total_cpus;
     }
 
+    if (fake_nodes > 0) {
+        // contiguous block split of the allowed CPUs, the same shape as a real per-socket
+        // split and as the thread block split in ggml_numa_node_for_thread()
+        uint32_t allowed[GGML_NUMA_MAX_CPUS];
+        uint32_t n_allowed = 0;
+        for (uint32_t c = 0; c < g_state.numa.total_cpus && n_allowed < GGML_NUMA_MAX_CPUS; ++c) {
+            if (CPU_ISSET(c, &g_state.numa.cpuset)) {
+                allowed[n_allowed++] = c;
+            }
+        }
+        if (n_allowed < fake_nodes) {
+            fprintf(stderr, "%s: GGML_NUMA_FAKE=%u but only %u allowed CPUs, keeping real topology\n",
+                    __func__, fake_nodes, n_allowed);
+        } else {
+            g_state.numa.fake    = true;
+            g_state.numa.n_nodes = fake_nodes;
+            for (uint32_t n = 0; n < fake_nodes; ++n) {
+                struct ggml_numa_node * node = &g_state.numa.nodes[n];
+                const uint32_t first = ( n      * n_allowed) / fake_nodes;
+                const uint32_t last  = ((n + 1) * n_allowed) / fake_nodes;
+                node->n_cpus = 0;
+                for (uint32_t i = first; i < last; ++i) {
+                    node->cpus[node->n_cpus++] = allowed[i];
+                }
+            }
+            GGML_PRINT("%s: FAKE NUMA topology: %u nodes over %u CPUs (testbed mode, no memory binding)\n",
+                       __func__, fake_nodes, n_allowed);
+        }
+    }
+
     GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
+
+    g_state.numa.primary_gpu_node = -1; // init to -1
+    g_state.numa.bind_compute = false;
+
+    // GGML_NUMA_PIN=cpu pins each mirror-mode thread to one specific CPU instead of the whole
+    // node, preventing the scheduler from migrating threads across CCDs (each with its own L3).
+    // Physical cores come first in sysfs order, so SMT siblings are only used when oversubscribed.
+    {
+        const char * pin = getenv("GGML_NUMA_PIN");
+        g_state.numa.pin_cpu = pin == NULL || (strcmp(pin, "cpu") == 0 || strcmp(pin, "1") == 0);
+    }
 
     // figure out which node we're on
     uint current_cpu;
@@ -4807,22 +5229,189 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
     GGML_PRINT_DEBUG("found our process on numa node %u, CPU %u\n", g_state.numa.current_node, current_cpu);
 
-    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
-        struct ggml_numa_node * node = &g_state.numa.nodes[n];
-        GGML_PRINT_DEBUG("CPUs on node %u:", n);
-        node->n_cpus = 0;
-        for (uint32_t c = 0; c < g_state.numa.total_cpus; ++c) {
-            rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", n, c);
-            GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
-            if (stat(path, &st) == 0) {
-                node->cpus[node->n_cpus++] = c;
-                GGML_PRINT_DEBUG(" %u", c);
+    if (g_state.numa.fake) {
+        // getcpu() reported the real (single) node; remap via the fake CPU->node table
+        g_state.numa.current_node = 0;
+        for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+            for (uint32_t i = 0; i < g_state.numa.nodes[n].n_cpus; ++i) {
+                if (g_state.numa.nodes[n].cpus[i] == current_cpu) {
+                    g_state.numa.current_node = n;
+                    n = g_state.numa.n_nodes; // break both loops
+                    break;
+                }
             }
         }
-        GGML_PRINT_DEBUG("\n");
+    } else {
+        for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+            struct ggml_numa_node * node = &g_state.numa.nodes[n];
+            GGML_PRINT_DEBUG("CPUs on node %u:", n);
+            node->n_cpus = 0;
+            for (uint32_t c = 0; c < g_state.numa.total_cpus; ++c) {
+                rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u/cpu%u", n, c);
+                GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
+                if (stat(path, &st) == 0) {
+                    node->cpus[node->n_cpus++] = c;
+                    GGML_PRINT_DEBUG(" %u", c);
+                }
+            }
+            GGML_PRINT_DEBUG("\n");
+        }
     }
 
-    if (ggml_is_numa()) {
+    // GGML_NUMA_RESERVE_CPUS=N[@node]: drop the last N CPUs from one node's pinning set so
+    // unpinned threads (CUDA driver, backend scheduler, main thread) get dedicated cores
+    // instead of competing with pinned compute threads. Default target is the last node;
+    // pass e.g. 2@0 to reserve on node 0. The thread block split is CPU-count weighted
+    // (ggml_numa_node_first_thread), so the trimmed node automatically gets fewer threads.
+    {
+        const char * s = getenv("GGML_NUMA_RESERVE_CPUS");
+        if (s && *s && g_state.numa.n_nodes > 1) {
+            char * end = NULL;
+            long   cnt  = strtol(s, &end, 10);
+            long   nidx = (long) g_state.numa.n_nodes - 1;
+            if (end && *end == '@') {
+                nidx = strtol(end + 1, NULL, 10);
+            }
+            if (cnt > 0 && nidx >= 0 && nidx < (long) g_state.numa.n_nodes) {
+                struct ggml_numa_node * node = &g_state.numa.nodes[nidx];
+                const uint32_t drop = cnt < (long) node->n_cpus ? (uint32_t) cnt : node->n_cpus - 1; // keep >= 1
+                node->n_cpus -= drop;
+                GGML_PRINT("%s: reserved %u CPUs on node %ld for unpinned threads (GGML_NUMA_RESERVE_CPUS)\n",
+                           __func__, drop, nidx);
+            } else if (cnt != 0) {
+                fprintf(stderr, "%s: ignoring GGML_NUMA_RESERVE_CPUS=%s (want N or N@node)\n", __func__, s);
+            }
+        }
+    }
+
+    // GGML_NUMA_EXCLUDE_CPUS=list: comma-separated list of CPUs or ranges to exclude from thread pinning.
+    // e.g., "0,1,2-4". These CPUs are completely removed from the node's pinning set.
+    {
+        const char * s = getenv("GGML_NUMA_EXCLUDE_CPUS");
+        if (s && *s) {
+            const char * p = s;
+            while (*p) {
+                char * end = NULL;
+                long start_cpu = strtol(p, &end, 10);
+                if (p == end) {
+                    // Not a number, skip to next comma or end
+                    while (*p && *p != ',') p++;
+                    if (*p == ',') p++;
+                    continue;
+                }
+                long end_cpu = start_cpu;
+                if (*end == '-') {
+                    char * end2 = NULL;
+                    end_cpu = strtol(end + 1, &end2, 10);
+                    if (end2 == end + 1) {
+                        end_cpu = start_cpu; // Not a number after '-'
+                    } else {
+                        end = end2;
+                    }
+                }
+
+                if (start_cpu >= 0 && end_cpu >= start_cpu && end_cpu < (long) g_state.numa.total_cpus) {
+                    for (long exclude_cpu = start_cpu; exclude_cpu <= end_cpu; ++exclude_cpu) {
+                        for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+                            struct ggml_numa_node * node = &g_state.numa.nodes[n];
+                            for (uint32_t i = 0; i < node->n_cpus; ++i) {
+                                if (node->cpus[i] == (uint32_t)exclude_cpu) {
+                                    if (node->n_cpus == 1) {
+                                        GGML_ABORT("GGML_NUMA_EXCLUDE_CPUS must leave at least one CPU per NUMA node");
+                                    }
+                                    for (uint32_t j = i; j < node->n_cpus - 1; ++j) {
+                                        node->cpus[j] = node->cpus[j + 1];
+                                    }
+                                    node->n_cpus--;
+                                    GGML_PRINT("%s: excluded CPU %ld from NUMA node %u pinning set\n", __func__, exclude_cpu, n);
+                                    break; // CPU is only on one node
+                                }
+                            }
+                        }
+                    }
+                }
+                if (*end == ',') {
+                    p = end + 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    // testbed knobs, parsed here so they ride along with any --numa strategy:
+    // GGML_NUMA_STATS=1 dumps mirror-path counters at exit (=2: also per llama_print_timings);
+    // GGML_NUMA_XGMI_GBPS caps explicit cross-node copies to model the socket interconnect.
+    {
+        const char * s = getenv("GGML_NUMA_STATS");
+        if (s && *s && strcmp(s, "0") != 0) {
+            g_numa_stats_level = strcmp(s, "2") == 0 ? 2 : 1;
+            atexit(ggml_numa_stats_print);
+        }
+        s = getenv("GGML_NUMA_XGMI_GBPS");
+        if (s && *s) {
+            double v = atof(s);
+            if (v > 0.0) {
+                g_state.numa.throttle_gbps = v;
+                GGML_PRINT("%s: cross-node copy bandwidth capped at %.1f GB/s (GGML_NUMA_XGMI_GBPS)\n", __func__, v);
+            }
+        }
+        s = getenv("GGML_NUMA_NT_COPY");
+        if (s && *s && strcmp(s, "0") != 0) {
+            g_numa_nt_copy = true;
+            GGML_PRINT("%s: non-temporal stores enabled for cross-node copies (GGML_NUMA_NT_COPY)\n", __func__);
+        }
+        s = getenv("GGML_NUMA_SHARD_STEAL");
+        if (s && *s && strcmp(s, "0") != 0) {
+            g_numa_shard_steal = 1;
+            GGML_PRINT("%s: MoE expert rebalancing enabled (GGML_NUMA_SHARD_STEAL)\n", __func__);
+        }
+        s = getenv("GGML_NUMA_SHARD_STEAL_COST");
+        if (s && *s) {
+            double v = atof(s);
+            if (v >= 1.0) {
+                g_numa_steal_cost = v;
+                GGML_PRINT("%s: remote-expert cost ratio = %.2f (GGML_NUMA_SHARD_STEAL_COST)\n", __func__, v);
+            } else {
+                fprintf(stderr, "%s: ignoring GGML_NUMA_SHARD_STEAL_COST=%s (want >= 1.0)\n", __func__, s);
+            }
+        }
+        s = getenv("GGML_NUMA_SHARD_SCHED");
+        if (s && *s && strcmp(s, "0") == 0) {
+            g_numa_shard_sched = 0;
+            GGML_PRINT("%s: node-aware MoE scheduling DISABLED (GGML_NUMA_SHARD_SCHED=0); sharded experts "
+                       "will be computed by every node with remote reads - measurement only\n", __func__);
+        }
+        s = getenv("GGML_NUMA_HIER_BATCH_MAX");
+        if (s && *s) {
+            g_numa_hier_batch_max = (int) strtol(s, NULL, 10);
+            GGML_PRINT("%s: hierarchical barrier batch gate = %d (GGML_NUMA_HIER_BATCH_MAX%s)\n",
+                       __func__, g_numa_hier_batch_max, g_numa_hier_batch_max < 0 ? ", always hierarchical" : "");
+        }
+        s = getenv("GGML_NUMA_HUGETLB");
+        if (s && *s && strcmp(s, "0") != 0) {
+            g_numa_hugetlb = true;
+            GGML_PRINT("%s: explicit 2 MiB hugetlb pages for NUMA allocations (GGML_NUMA_HUGETLB)\n", __func__);
+        }
+        s = getenv("GGML_NUMA_COPY_THREADS");
+        if (s && *s) {
+            long v = strtol(s, NULL, 10);
+            if (v >= 1 && v <= GGML_NUMA_COPY_MAX_THREADS) {
+                g_numa_copy_threads = (int) v;
+            } else {
+                fprintf(stderr, "%s: ignoring GGML_NUMA_COPY_THREADS=%s (want 1..%d)\n", __func__, s, GGML_NUMA_COPY_MAX_THREADS);
+            }
+        }
+        s = getenv("GGML_NUMA_COPY_MIN_MB");
+        if (s && *s) {
+            long v = strtol(s, NULL, 10);
+            if (v >= 1) {
+                g_numa_copy_min = (size_t) v << 20;
+            }
+        }
+    }
+
+    if (!g_state.numa.fake && ggml_is_numa()) {
         FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
         if (fptr != NULL) {
             char buf[42];
@@ -4840,6 +5429,736 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+//
+// NUMA mirroring
+//
+
+// one node-local copy of a tensor's data per NUMA node. Stored behind ggml_tensor::data_numa.
+struct ggml_numa_mirror {
+    void * data[GGML_NUMA_MAX_NODES];
+};
+
+// hot path: return the caller-thread's node-local copy of a (possibly view) tensor's data,
+// or its plain ->data when the tensor is not mirrored. data_numa == NULL for ~all tensors.
+// Returns void* (like tensor->data) so call sites cast exactly as they did for ->data.
+// Walks the view_src chain so views-of-views still resolve to node-local memory; in practice
+// this is only ever called on src0 weights (direct -> returns on iteration 1) and KV reads
+// (one-level views), so the loop is <=2 and adds no measurable hot-path cost.
+static inline void * ggml_numa_tensor_data(const struct ggml_tensor * t, int node) {
+    for (const struct ggml_tensor * a = t; a; a = a->view_src) {
+        if (a->data_numa) {
+            void * base = ((const struct ggml_numa_mirror *) a->data_numa)->data[node];
+#if defined(__gnu_linux__)
+            if (g_numa_stats_level) {
+                atomic_fetch_add_explicit(base ? &g_numa_stats.node[node].resolve_hit
+                                               : &g_numa_stats.node[node].resolve_fallback,
+                                          1ULL, memory_order_relaxed);
+            }
+#endif
+            // offset from the already-resolved pointers (t->data == a->data + accumulated view offs)
+            return base ? (char *) base + ((const char *) t->data - (const char *) a->data) : t->data;
+        }
+    }
+    return t->data;
+}
+
+int ggml_numa_node_count(void) {
+    return g_state.numa.n_nodes > 0 ? (int) g_state.numa.n_nodes : 1;
+}
+
+bool ggml_numa_mirror_active(void) {
+    return g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR && g_state.numa.n_nodes > 1;
+}
+
+void ggml_numa_set_mirror(uint32_t flags) {
+    g_state.numa.mirror_flags = flags;
+}
+
+uint32_t ggml_numa_get_mirror(void) {
+    return g_state.numa.mirror_flags;
+}
+
+void ggml_numa_set_primary_gpu_node(int node) {
+    if (node < 0 || node >= (int) g_state.numa.n_nodes) {
+        fprintf(stderr, "%s: node %d is not a valid NUMA node (%u nodes detected), ignoring\n",
+                __func__, node, g_state.numa.n_nodes);
+        g_state.numa.primary_gpu_node = -1;
+        return;
+    }
+    g_state.numa.primary_gpu_node = node;
+}
+
+int ggml_numa_get_primary_gpu_node(void) {
+    return g_state.numa.primary_gpu_node;
+}
+
+void ggml_numa_set_bind_compute(bool enable) {
+    if (enable && g_state.numa.primary_gpu_node < 0) {
+        fprintf(stderr, "%s: --numa-bind-compute requires a valid --numa-gpu-node, ignoring\n", __func__);
+        return;
+    }
+    g_state.numa.bind_compute = enable;
+}
+
+bool ggml_numa_get_bind_compute(void) {
+    return g_state.numa.bind_compute && g_state.numa.primary_gpu_node >= 0;
+}
+
+// First thread index of node k under the CPU-weighted block split (k == n_nodes -> nth).
+// Weighted by each node's pinnable CPU count so an asymmetric topology (e.g. cores held
+// back via GGML_NUMA_RESERVE_CPUS for the CUDA driver) gets proportionally fewer threads;
+// with symmetric nodes this is exactly the historical even split ceil(k*nth/n).
+static int ggml_numa_node_first_thread(int k, int nth) {
+    const int n = (int) g_state.numa.n_nodes;
+    if (n <= 1) {
+        return k <= 0 ? 0 : nth;
+    }
+    uint64_t total = 0;
+    for (int j = 0; j < n; ++j) {
+        total += g_state.numa.nodes[j].n_cpus;
+    }
+    if (total == 0) { // topology without CPU lists: fall back to the even split
+        return (int) (((uint64_t) k * nth + n - 1) / n);
+    }
+    uint64_t cum = 0;
+    for (int j = 0; j < k && j < n; ++j) {
+        cum += g_state.numa.nodes[j].n_cpus;
+    }
+    return (int) (((uint64_t) nth * cum + total - 1) / total);
+}
+
+// block split of [0, nth) threads across the detected NUMA nodes. Used by BOTH the thread
+// affinity pinning and the per-thread weight-pointer redirection, so they always agree.
+int ggml_numa_node_for_thread(int ith, int nth) {
+    int n = (int) g_state.numa.n_nodes;
+    if (n <= 1 || nth <= 0) {
+        return 0;
+    }
+    for (int k = 0; k < n - 1; ++k) {
+        if (ith < ggml_numa_node_first_thread(k + 1, nth)) {
+            return k;
+        }
+    }
+    return n - 1;
+}
+
+// Expert-affinity sharding (--numa-mirror dense). Set by llama.cpp once the routed-expert
+// weights have actually been pinned one node each; drives the node-aware MoE scheduling below.
+static bool g_numa_expert_shard = false;
+
+void ggml_numa_set_expert_shard(bool enable) {
+    g_numa_expert_shard = enable;
+}
+
+bool ggml_numa_expert_shard_active(void) {
+    return g_numa_expert_shard;
+}
+
+// Stage 2 of expert-affinity sharding. With --numa-mirror dense, expert e's weights exist only
+// on node e % n_nodes (see llama_numa_shard_expert_tensor), so every other node computing it
+// would be streaming the weights across the interconnect. Returns false when the calling thread
+// should skip this expert entirely; when it returns true it hands back a node-local (ith, nth)
+// so the owning node's threads split the expert's rows among themselves exactly as all nth
+// threads used to split them.
+//
+// Safe to skip because there is no barrier inside the expert loop -- the barrier is before it,
+// and dst is [n_embd, n_expert_used, n_tokens] so each (token, expert) is a disjoint slot and
+// needs no cross-node reduction.
+static inline bool ggml_numa_expert_scope(int cur_a, int ith, int nth, int * e_ith, int * e_nth) {
+    *e_ith = ith;
+    *e_nth = nth;
+    if (!g_numa_expert_shard || !g_numa_shard_sched) {
+        // GGML_NUMA_SHARD_SCHED=0 keeps stage-1 placement but restores the old schedule (every
+        // node computes every expert), so ~half the expert reads are remote. Paired against
+        // --numa mirror -- same work split, only locality differs -- it isolates the remote-read
+        // penalty on real hardware, which is the number that decides whether an idle node is
+        // better off stealing work than waiting. Tuning knob; leave at 1 for serving.
+        return true;
+    }
+    const int n_nodes = (int) g_state.numa.n_nodes;
+    if (n_nodes < 2) {
+        return true;
+    }
+    // the rebalancer may have moved this expert off its owner; every thread reads the same table
+    const int owner = (g_numa_expert_assigned > cur_a) ? g_numa_expert_node[cur_a] : (cur_a % n_nodes);
+    const int node  = ggml_numa_node_for_thread(ith, nth);
+    if (node != owner) {
+        return false;
+    }
+    const int first = ggml_numa_node_first_thread(owner, nth);
+    const int last  = ggml_numa_node_first_thread(owner + 1, nth);
+    if (last <= first) {
+        return true; // node owns no threads: fall back to the global split rather than divide by 0
+    }
+#if defined(__gnu_linux__)
+    if (g_numa_stats_level && ith == first) {
+        // counted once per expert by the node's first thread, so this reads as "experts computed
+        // by this node" -- max/mean across nodes is the routing imbalance the split has to eat
+        atomic_fetch_add_explicit(&g_numa_stats.node[node].moe_experts, 1ULL, memory_order_relaxed);
+    }
+#endif
+    *e_ith = ith - first;
+    *e_nth = last - first;
+    return true;
+}
+
+int ggml_numa_stats_level(void) {
+    return g_numa_stats_level;
+}
+
+void ggml_numa_stats_print(void) {
+#if defined(__gnu_linux__)
+    if (g_state.numa.n_nodes < 1) {
+        return;
+    }
+    const uint32_t n = g_state.numa.n_nodes;
+    fprintf(stderr, "numa_stats: nodes=%u fake=%d strategy=%u throttle_gbps=%.1f\n",
+            n, g_state.numa.fake ? 1 : 0, g_state.numa.numa_strategy, g_state.numa.throttle_gbps);
+    for (uint32_t k = 0; k < n && k < GGML_NUMA_MAX_NODES; ++k) {
+        fprintf(stderr, "numa_stats: node%u resolve_hit=%llu resolve_fallback=%llu moe_experts=%llu\n", k,
+                (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].resolve_hit,      memory_order_relaxed),
+                (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].resolve_fallback, memory_order_relaxed),
+                (unsigned long long) atomic_load_explicit(&g_numa_stats.node[k].moe_experts,      memory_order_relaxed));
+    }
+    if (g_numa_expert_shard) {
+        // how lopsided the routing made the per-node expert split: the busier node gates every
+        // token, so this ratio is roughly the throughput left on the table vs a perfect balance
+        uint64_t tot = 0, mx = 0;
+        for (uint32_t k = 0; k < n && k < GGML_NUMA_MAX_NODES; ++k) {
+            const uint64_t v = atomic_load_explicit(&g_numa_stats.node[k].moe_experts, memory_order_relaxed);
+            tot += v;
+            if (v > mx) mx = v;
+        }
+        const double mean = n > 0 ? (double) tot / n : 0.0;
+        fprintf(stderr, "numa_stats: expert_shard=1 moe_experts_total=%llu moe_experts_max=%llu max_over_mean=%.2f\n",
+                (unsigned long long) tot, (unsigned long long) mx, mean > 0 ? (double) mx / mean : 0.0);
+    }
+    fprintf(stderr, "numa_stats: populate_bytes=%llu populate_calls=%llu populate_us=%llu resync_bytes=%llu resync_calls=%llu\n",
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.populate_bytes, memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.populate_calls, memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.populate_us,    memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.resync_bytes,   memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.resync_calls,   memory_order_relaxed));
+    fprintf(stderr, "numa_stats: kv_repl_bytes=%llu kv_repl_calls=%llu barriers_hier=%llu barriers_flat=%llu throttle_sleep_us=%llu\n",
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.kv_repl_bytes,     memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.kv_repl_calls,     memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.barriers_hier,     memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.barriers_flat,     memory_order_relaxed),
+            (unsigned long long) atomic_load_explicit(&g_numa_stats.throttle_sleep_us, memory_order_relaxed));
+    if (g_numa_moe_stats.n_expert > 0) {
+        uint64_t total = 0, mx = 0;
+        for (int a = 0; a < g_numa_moe_stats.n_expert; ++a) {
+            total += g_numa_moe_stats.rows[a];
+            if (g_numa_moe_stats.rows[a] > mx) mx = g_numa_moe_stats.rows[a];
+        }
+        const double mean = g_numa_moe_stats.n_expert > 0 ? (double) total / g_numa_moe_stats.n_expert : 0.0;
+        fprintf(stderr, "numa_stats: moe_ops=%llu n_expert=%d expert_rows_total=%llu expert_rows_max=%llu max_over_mean=%.2f\n",
+                (unsigned long long) g_numa_moe_stats.ops, g_numa_moe_stats.n_expert,
+                (unsigned long long) total, (unsigned long long) mx, mean > 0 ? (double) mx / mean : 0.0);
+        if (g_numa_moe_stats.skew_ops > 0) {
+            // node_skew_mean is the fraction of extra time the average MoE op spends waiting on
+            // its busiest node under owner(e) = e % n_nodes: 1.00 is a perfect split, 2.00 means
+            // one node does everything. This, not the cumulative per-node totals, is the
+            // throughput a shard run gives up to routing imbalance.
+            // pure key=value: parse_numa_stats treats any bare token as a prefix for the rest
+            // of the line, so free text here would silently rename the keys after it
+            fprintf(stderr, "numa_stats: moe_node_skew_mean=%.3f moe_node_skew_max=%.3f moe_node_skew_ops=%llu\n",
+                    g_numa_moe_stats.skew_sum / (double) g_numa_moe_stats.skew_ops,
+                    g_numa_moe_stats.skew_max,
+                    (unsigned long long) g_numa_moe_stats.skew_ops);
+            // NB: skew above is always measured against the owner() split, so it stays comparable
+            // across runs and shows the imbalance the rebalancer was asked to remove.
+            if (g_numa_shard_steal && g_numa_moe_stats.after_ops > 0) {
+                fprintf(stderr, "numa_stats: moe_rebalance=1 moe_steal_cost=%.2f moe_moves=%llu "
+                        "moe_moves_per_op=%.2f moe_skew_after=%.3f moe_skew_before=%.3f\n",
+                        g_numa_steal_cost, (unsigned long long) g_numa_moe_stats.moves,
+                        (double) g_numa_moe_stats.moves / (double) g_numa_moe_stats.skew_ops,
+                        g_numa_moe_stats.after_sum / (double) g_numa_moe_stats.after_ops,
+                        g_numa_moe_stats.skew_sum  / (double) g_numa_moe_stats.skew_ops);
+            }
+        }
+        fprintf(stderr, "numa_stats: moe_expert_rows=");
+        for (int a = 0; a < g_numa_moe_stats.n_expert; ++a) {
+            fprintf(stderr, "%s%llu", a ? "," : "", (unsigned long long) g_numa_moe_stats.rows[a]);
+        }
+        fprintf(stderr, "\n");
+    }
+    if (g_numa_stats_level >= 2) {
+        // per-phase mode: caller dumps after each llama_print_timings, so restart the window
+        memset(&g_numa_moe_stats, 0, sizeof(g_numa_moe_stats));
+        for (uint32_t k = 0; k < GGML_NUMA_MAX_NODES; ++k) {
+            atomic_store_explicit(&g_numa_stats.node[k].resolve_hit,      0ULL, memory_order_relaxed);
+            atomic_store_explicit(&g_numa_stats.node[k].resolve_fallback, 0ULL, memory_order_relaxed);
+        }
+        atomic_store_explicit(&g_numa_stats.populate_bytes,    0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.populate_calls,    0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.populate_us,       0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.resync_bytes,      0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.resync_calls,      0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.kv_repl_bytes,     0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.kv_repl_calls,     0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.barriers_hier,     0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.barriers_flat,     0ULL, memory_order_relaxed);
+        atomic_store_explicit(&g_numa_stats.throttle_sleep_us, 0ULL, memory_order_relaxed);
+    }
+#endif
+}
+
+#if defined(__gnu_linux__)
+// pace an explicit cross-node copy to g_state.numa.throttle_gbps: `bytes` were copied since
+// t_start_us; wait out the remainder of the modeled transfer time. Spin for sub-200us tails
+// (nanosleep granularity under WSL2 is far coarser), nanosleep for longer ones.
+static void ggml_numa_paced_wait(size_t bytes, double gbps, int64_t t_start_us) {
+    if (gbps <= 0.0 || bytes == 0) {
+        return;
+    }
+    const int64_t target_us = (int64_t) ((double) bytes / (gbps * 1e3)); // GB/s == bytes/us * 1e-3
+    const int64_t deadline  = t_start_us + target_us;
+    int64_t now = ggml_time_us();
+    if (now >= deadline) {
+        return;
+    }
+    const int64_t waited = deadline - now;
+    while (now < deadline) {
+        const int64_t left = deadline - now;
+        if (left > 200) {
+            struct timespec ts = { .tv_sec = left / 1000000, .tv_nsec = (left % 1000000) * 1000 };
+            nanosleep(&ts, NULL);
+        } else {
+            ggml_numa_spin_pause();
+        }
+        now = ggml_time_us();
+    }
+    if (g_numa_stats_level) {
+        GGML_NUMA_STAT_ADD(throttle_sleep_us, waited);
+    }
+}
+#endif
+
+#if defined(__gnu_linux__)
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef MPOL_MF_MOVE
+#define MPOL_MF_MOVE (1 << 1)
+#endif
+
+static long ggml_sys_mbind(void * addr, unsigned long len, int mode,
+                           const unsigned long * nodemask, unsigned long maxnode, unsigned flags) {
+#if defined(SYS_mbind)
+    if (g_state.numa.fake) {
+        return 0; // fake topology: all memory really is one node; binding would fail or mislead
+    }
+    return syscall(SYS_mbind, addr, len, mode, nodemask, maxnode, flags);
+#else
+    UNUSED(addr); UNUSED(len); UNUSED(mode); UNUSED(nodemask); UNUSED(maxnode); UNUSED(flags);
+    return -1;
+#endif
+}
+#endif
+
+#define GGML_NUMA_HUGE_ALIGN ((size_t) (2u << 20)) // 2 MiB, for transparent huge pages
+
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
+#endif
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
+#endif
+
+void * ggml_numa_alloc(size_t size, int node) {
+#if defined(__gnu_linux__)
+    size_t aligned = (size + GGML_NUMA_HUGE_ALIGN - 1) & ~(GGML_NUMA_HUGE_ALIGN - 1);
+    void * p = MAP_FAILED;
+    if (g_numa_hugetlb) {
+        // explicit 2 MiB pages from the hugetlb pool: guaranteed huge mappings (no THP
+        // best-effort), at the cost of requiring vm.nr_hugepages to be preallocated
+        p = mmap(NULL, aligned, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+        if (p == MAP_FAILED) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "%s: hugetlb mmap of %zu bytes failed (pool exhausted or vm.nr_hugepages unset), falling back to THP\n",
+                        __func__, aligned);
+            }
+        }
+    }
+    if (p == MAP_FAILED) {
+        p = mmap(NULL, aligned, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    if (p == MAP_FAILED) {
+        return NULL;
+    }
+    // bind the pages to the target node (strict). MPOL_BIND also exempts these pages from
+    // auto NUMA balancing migration. First-touch by a node-pinned memcpy placer is the backup.
+    if (node >= 0 && node < (int) g_state.numa.n_nodes) {
+        const size_t bits = 8 * sizeof(unsigned long);
+        unsigned long nodemask[(GGML_NUMA_MAX_NODES + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long))];
+        memset(nodemask, 0, sizeof(nodemask));
+        nodemask[node / bits] |= 1UL << (node % bits);
+        ggml_sys_mbind(p, aligned, MPOL_BIND, nodemask, GGML_NUMA_MAX_NODES + 1, 0);
+    }
+    madvise(p, aligned, MADV_HUGEPAGE);
+    return p;
+#else
+    UNUSED(node);
+    return malloc(size);
+#endif
+}
+
+void ggml_numa_free(void * ptr, size_t size) {
+    if (!ptr) {
+        return;
+    }
+#if defined(__gnu_linux__)
+    size_t aligned = (size + GGML_NUMA_HUGE_ALIGN - 1) & ~(GGML_NUMA_HUGE_ALIGN - 1);
+    munmap(ptr, aligned);
+#else
+    UNUSED(size);
+    free(ptr);
+#endif
+}
+
+// best-effort migration of an already-populated range (e.g. the original weight buffer) onto a
+// given node. Used to make node 0's "copy" (which aliases the original buffer) node-0-local.
+void ggml_numa_bind(void * ptr, size_t size, int node) {
+#if defined(__gnu_linux__)
+    if (!ptr || node < 0 || node >= (int) g_state.numa.n_nodes) {
+        return;
+    }
+    long pg = sysconf(_SC_PAGESIZE);
+    if (pg <= 0) pg = 4096;
+    uintptr_t start = (uintptr_t) ptr;
+    uintptr_t aligned_start = start & ~((uintptr_t) pg - 1);
+    size_t len = size + (size_t) (start - aligned_start);
+    const size_t bits = 8 * sizeof(unsigned long);
+    unsigned long nodemask[(GGML_NUMA_MAX_NODES + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long))];
+    memset(nodemask, 0, sizeof(nodemask));
+    nodemask[node / bits] |= 1UL << (node % bits);
+    ggml_sys_mbind((void *) aligned_start, len, MPOL_BIND, nodemask, GGML_NUMA_MAX_NODES + 1, MPOL_MF_MOVE);
+#else
+    UNUSED(ptr); UNUSED(size); UNUSED(node);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// parallel node-pinned memcpy: used to populate weight/KV mirrors at load and to
+// resync KV mirrors after out-of-graph writes (K-shift, state restore). A single
+// thread tops out well below the socket interconnect's bandwidth; several threads
+// pinned to the *destination* node (local writes, remote reads) get close to it.
+// ---------------------------------------------------------------------------
+#if defined(__gnu_linux__)
+struct ggml_numa_copy_slice {
+    const char * src;
+    char *       dst;
+    size_t       size;
+    int          node;
+    double       gbps; // this worker's share of GGML_NUMA_XGMI_GBPS (0 = unthrottled)
+};
+
+// non-temporal copy: streaming stores bypass the cache hierarchy, so bulk mirror traffic
+// neither evicts the working set nor bounces through L3 on its way to the other "node"
+static void ggml_numa_nt_memcpy(char * dst, const char * src, size_t n) {
+#if defined(__AVX512F__)
+    size_t i = 0;
+    const size_t mis = (uintptr_t) dst & 63;
+    if (mis) {
+        size_t head = 64 - mis;
+        if (head > n) head = n;
+        memcpy(dst, src, head);
+        i = head;
+    }
+    for (; i + 64 <= n; i += 64) {
+        _mm512_stream_si512((__m512i *) (dst + i), _mm512_loadu_si512((const void *) (src + i)));
+    }
+    _mm_sfence();
+    if (i < n) {
+        memcpy(dst + i, src + i, n - i);
+    }
+#elif defined(__SSE2__)
+    size_t i = 0;
+    const size_t mis = (uintptr_t) dst & 15;
+    if (mis) {
+        size_t head = 16 - mis;
+        if (head > n) head = n;
+        memcpy(dst, src, head);
+        i = head;
+    }
+    for (; i + 16 <= n; i += 16) {
+        _mm_stream_si128((__m128i *) (dst + i), _mm_loadu_si128((const __m128i *) (src + i)));
+    }
+    _mm_sfence();
+    if (i < n) {
+        memcpy(dst + i, src + i, n - i);
+    }
+#else
+    memcpy(dst, src, n);
+#endif
+}
+
+#define GGML_NUMA_NT_MIN (4u << 20) // below this, cache pollution doesn't matter; plain memcpy wins
+
+// copy with the effective bandwidth capped at gbps: 8 MiB bursts, pacing after each so the
+// modeled interconnect stalls are spread over the transfer instead of tacked onto the end
+static void ggml_numa_throttled_memcpy(char * dst, const char * src, size_t size, double gbps) {
+    const bool nt = g_numa_nt_copy && size >= GGML_NUMA_NT_MIN;
+    if (gbps <= 0.0) {
+        if (nt) {
+            ggml_numa_nt_memcpy(dst, src, size);
+        } else {
+            memcpy(dst, src, size);
+        }
+        return;
+    }
+    const size_t  burst = 8u << 20;
+    const int64_t t0    = ggml_time_us();
+    size_t done = 0;
+    while (done < size) {
+        const size_t n = size - done < burst ? size - done : burst;
+        if (nt) {
+            ggml_numa_nt_memcpy(dst + done, src + done, n);
+        } else {
+            memcpy(dst + done, src + done, n);
+        }
+        done += n;
+        ggml_numa_paced_wait(done, gbps, t0);
+    }
+}
+
+static void * ggml_numa_copy_worker(void * arg) {
+    struct ggml_numa_copy_slice * s = (struct ggml_numa_copy_slice *) arg;
+    if (s->node >= 0 && s->node < (int) g_state.numa.n_nodes) {
+        const struct ggml_numa_node * nd = &g_state.numa.nodes[s->node];
+        size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
+        cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
+        if (cpus) {
+            CPU_ZERO_S(setsize, cpus);
+            for (uint32_t i = 0; i < nd->n_cpus; ++i) {
+                CPU_SET_S(nd->cpus[i], setsize, cpus);
+            }
+            pthread_setaffinity_np(pthread_self(), setsize, cpus); // best effort
+            CPU_FREE(cpus);
+        }
+    }
+    ggml_numa_throttled_memcpy(s->dst, s->src, s->size, s->gbps);
+    return NULL;
+}
+#endif
+
+void ggml_numa_memcpy_to_node(void * dst, const void * src, size_t size, int node) {
+#if defined(__gnu_linux__)
+    const int64_t t_enter = g_numa_stats_level ? ggml_time_us() : 0;
+    if (g_numa_stats_level) {
+        GGML_NUMA_STAT_ADD(populate_bytes, size);
+        GGML_NUMA_STAT_ADD(populate_calls, 1);
+    }
+    const double gbps = g_state.numa.throttle_gbps;
+    int nthr = g_numa_copy_threads;
+    if (node >= 0 && node < (int) g_state.numa.n_nodes && (int) g_state.numa.nodes[node].n_cpus < nthr) {
+        nthr = (int) g_state.numa.nodes[node].n_cpus;
+    }
+    if (size < g_numa_copy_min || nthr <= 1 || g_state.numa.n_nodes < 2) {
+        ggml_numa_throttled_memcpy((char *) dst, (const char *) src, size, gbps);
+        if (g_numa_stats_level) {
+            GGML_NUMA_STAT_ADD(populate_us, ggml_time_us() - t_enter);
+        }
+        return;
+    }
+    pthread_t threads[GGML_NUMA_COPY_MAX_THREADS];
+    struct ggml_numa_copy_slice slices[GGML_NUMA_COPY_MAX_THREADS];
+    const size_t chunk = (size + nthr - 1) / nthr;
+    // workers share the modeled interconnect: each gets an equal slice of the cap
+    const int    n_active    = (int) ((size + chunk - 1) / chunk);
+    const double gbps_share  = gbps > 0.0 && n_active > 0 ? gbps / n_active : 0.0;
+    int started = 0;
+    for (int i = 0; i < nthr; ++i) {
+        const size_t off = (size_t) i * chunk;
+        if (off >= size) break;
+        slices[i].src  = (const char *) src + off;
+        slices[i].dst  = (char *) dst + off;
+        slices[i].size = off + chunk <= size ? chunk : size - off;
+        slices[i].node = node;
+        slices[i].gbps = gbps_share;
+        if (pthread_create(&threads[i], NULL, ggml_numa_copy_worker, &slices[i]) != 0) {
+            // couldn't spawn more workers: do this slice (and the rest) inline
+            for (int j = i; j < nthr; ++j) {
+                const size_t o = (size_t) j * chunk;
+                if (o >= size) break;
+                memcpy((char *) dst + o, (const char *) src + o, o + chunk <= size ? chunk : size - o);
+            }
+            break;
+        }
+        ++started;
+    }
+    for (int i = 0; i < started; ++i) {
+        pthread_join(threads[i], NULL);
+    }
+    if (g_numa_stats_level) {
+        GGML_NUMA_STAT_ADD(populate_us, ggml_time_us() - t_enter);
+    }
+#else
+    UNUSED(node);
+    memcpy(dst, src, size);
+#endif
+}
+
+// Configure the hierarchical barrier for the given thread count. Called single-threaded from
+// ggml_graph_compute before workers start. Allocates the node-local counter lines once.
+// Activates only when NUMA mirroring is on (threads are pinned per node, matching the block split
+// used by ggml_numa_node_for_thread); otherwise leaves the flat barrier in place.
+static void ggml_numa_barrier_setup(int n_threads) {
+    if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_MIRROR || g_state.numa.n_nodes < 2 || n_threads <= 1) {
+        g_numa_barrier.active = 0;
+        return;
+    }
+    const int n = (int) g_state.numa.n_nodes;
+    if (g_numa_barrier.node[0] == NULL) {
+        for (int k = 0; k < n; ++k) {
+            // node-local so the intra-node sync never crosses the interconnect (mmap is zeroed)
+            g_numa_barrier.node[k] = (struct ggml_numa_barrier_node *)
+                ggml_numa_alloc(sizeof(struct ggml_numa_barrier_node), k);
+            if (g_numa_barrier.node[k] == NULL) {
+                // allocation failed: undo and fall back to the flat barrier instead of risking
+                // a NULL deref in ggml_numa_hier_barrier()
+                for (int j = 0; j < k; ++j) {
+                    ggml_numa_free(g_numa_barrier.node[j], sizeof(struct ggml_numa_barrier_node));
+                    g_numa_barrier.node[j] = NULL;
+                }
+                g_numa_barrier.active = 0;
+                return;
+            }
+        }
+        atomic_store(&g_numa_barrier.global_arrive, 0);
+        atomic_store(&g_numa_barrier.global_release, 0);
+    }
+    int leaders = 0;
+    for (int k = 0; k < n; ++k) {
+        // contiguous block split, identical to ggml_numa_node_for_thread()
+        const int first_k  = ggml_numa_node_first_thread(k,     n_threads);
+        const int first_k1 = ggml_numa_node_first_thread(k + 1, n_threads);
+        g_numa_barrier.node_nth[k] = first_k1 - first_k;
+        if (g_numa_barrier.node_nth[k] > 0) {
+            ++leaders;
+        }
+    }
+    g_numa_barrier.n_leaders = leaders;
+    g_numa_barrier.active = 1;
+}
+
+void ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data) {
+    int n = ggml_numa_node_count();
+    struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) tensor->data_numa;
+    if (!m) {
+        m = (struct ggml_numa_mirror *) malloc(sizeof(struct ggml_numa_mirror));
+        for (int i = 0; i < GGML_NUMA_MAX_NODES; ++i) {
+            m->data[i] = NULL;
+        }
+        tensor->data_numa = m;
+    }
+    for (int i = 0; i < n && i < GGML_NUMA_MAX_NODES; ++i) {
+        m->data[i] = node_data[i];
+    }
+}
+
+void ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor) {
+    if (tensor->data_numa) {
+        free(tensor->data_numa);
+        tensor->data_numa = NULL;
+    }
+}
+
+// Cold path only (state restore, K-shift, cache clear): re-copy node 0's bytes into every
+// other node copy of a mirrored tensor, so writes that bypass the graph CPY replication don't
+// leave stale node-local data. No-op when the tensor isn't mirrored. Not on any per-token path.
+void ggml_numa_tensor_resync(struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->data_numa) {
+        return;
+    }
+    struct ggml_numa_mirror * m = (struct ggml_numa_mirror *) tensor->data_numa;
+    const int    nodes  = ggml_numa_node_count();
+    const size_t nbytes = ggml_nbytes(tensor);
+    for (int n = 1; n < nodes; ++n) { // node 0 aliases tensor->data
+        if (m->data[n] && m->data[n] != tensor->data) {
+            ggml_numa_memcpy_to_node(m->data[n], tensor->data, nbytes, n);
+#if defined(__gnu_linux__)
+            if (g_numa_stats_level) {
+                GGML_NUMA_STAT_ADD(resync_bytes, nbytes);
+            }
+#endif
+        }
+    }
+#if defined(__gnu_linux__)
+    if (g_numa_stats_level && nodes > 1) {
+        GGML_NUMA_STAT_ADD(resync_calls, 1);
+    }
+#endif
+}
+
+// NUMA mirror (KV cache): after a cpy/dup has written node 0's copy of a mirrored KV tensor view,
+// replicate the freshly written rows to every other node's copy, so each node's attention reads
+// valid node-local K/V. No-op for any tensor that isn't a mirrored KV destination.
+static void ggml_numa_replicate_kv_write(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
+    // walk the view chain to find the mirrored base tensor (the k_l / v_l cache tensor)
+    const struct ggml_tensor * t = dst;
+    struct ggml_numa_mirror * m = NULL;
+    while (t) {
+        if (t->data_numa) { m = (struct ggml_numa_mirror *) t->data_numa; break; }
+        t = t->view_src;
+    }
+    if (!m) {
+        return;
+    }
+    const int nodes = ggml_numa_node_count();
+    if (nodes < 2) {
+        return;
+    }
+    // make sure node 0's copy is fully written before we read it to replicate
+    ggml_barrier(params->shared);
+
+    const int     ith   = params->ith;
+    const int     nth   = params->nth;
+    const size_t  run   = ggml_row_size(dst->type, dst->ne[0]); // contiguous bytes per dim-0 row
+    const int64_t n1    = dst->ne[1], n2 = dst->ne[2], n3 = dst->ne[3];
+    const int64_t nrows = n1*n2*n3;
+    const char *  base0 = (const char *) m->data[0]; // node 0 aliases the root tensor's data
+#if defined(__gnu_linux__)
+    const int64_t t0 = ggml_time_us();
+#endif
+    size_t local_bytes = 0;
+    for (int64_t r = ith; r < nrows; r += nth) {
+        const int64_t i1 = r % n1;
+        const int64_t i2 = (r / n1) % n2;
+        const int64_t i3 = r / (n1*n2);
+        char * row0 = (char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
+        const size_t off = (size_t) (row0 - base0);
+        for (int n = 1; n < nodes; ++n) {
+            memcpy((char *) m->data[n] + off, row0, run);
+        }
+        local_bytes += run * (nodes - 1);
+    }
+#if defined(__gnu_linux__)
+    // model the interconnect: this fan-out is exactly the traffic that crosses sockets per
+    // token, so pace each thread to its share of the modeled bandwidth before the next op
+    if (g_state.numa.throttle_gbps > 0.0 && nth > 0) {
+        ggml_numa_paced_wait(local_bytes, g_state.numa.throttle_gbps / nth, t0);
+    }
+    if (g_numa_stats_level) {
+        if (local_bytes > 0) {
+            GGML_NUMA_STAT_ADD(kv_repl_bytes, local_bytes);
+        }
+        if (ith == 0) {
+            GGML_NUMA_STAT_ADD(kv_repl_calls, 1);
+        }
+    }
+#else
+    UNUSED(local_bytes);
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -5353,6 +6672,10 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         /*.scratch_save       =*/ { 0, 0, NULL, },
     };
 
+    if (g_state.numa.primary_gpu_node >= 0 && ctx->mem_buffer_owned) {
+        ggml_numa_bind(ctx->mem_buffer, mem_size, g_state.numa.primary_gpu_node);
+    }
+
     GGML_ASSERT(ctx->mem_buffer != NULL);
 
     GGML_ASSERT_ALIGNED(ctx->mem_buffer);
@@ -5587,7 +6910,8 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
-        ///*.padding      =*/ { 0 },
+        /*.data_numa    =*/ NULL,
+        /*.padding      =*/ { 0 },
     };
 
 #ifdef __clang__
@@ -13034,32 +14358,31 @@ static void ggml_compute_forward_dup(
 
     if (ggml_is_quantized(src0->type)) {
         ggml_compute_forward_dup_q(params, dst);
-        return;
-    }
-
-    if (src0->type == dst->type) {
+    } else if (src0->type == dst->type) {
         ggml_compute_forward_dup_bytes(params, dst);
-        return;
+    } else {
+        switch (src0->type) {
+            case GGML_TYPE_F16:
+                {
+                    ggml_compute_forward_dup_f16(params, dst);
+                } break;
+            case GGML_TYPE_BF16:
+                {
+                    ggml_compute_forward_dup_bf16(params, dst);
+                } break;
+            case GGML_TYPE_F32:
+                {
+                    ggml_compute_forward_dup_f32(params, dst);
+                } break;
+            default:
+                {
+                    GGML_ABORT("fatal error");
+                }
+        }
     }
 
-    switch (src0->type) {
-        case GGML_TYPE_F16:
-            {
-                ggml_compute_forward_dup_f16(params, dst);
-            } break;
-        case GGML_TYPE_BF16:
-            {
-                ggml_compute_forward_dup_bf16(params, dst);
-            } break;
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_dup_f32(params, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("fatal error");
-            }
-    }
+    // NUMA mirror: if this dup wrote a mirrored KV-cache view, fan the new rows out to each node copy
+    ggml_numa_replicate_kv_write(params, dst);
 }
 
 // ggml_compute_forward_add
@@ -17872,6 +19195,7 @@ static void ggml_compute_forward_group_norm(
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
+    const int numa_node,
     const int64_t num_rows_per_vec_dot,
     const int64_t ir0_start,
     const int64_t ir0_end,
@@ -17882,6 +19206,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_tensor * src1 = dst->src[1];
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // node-local copy of the weights when NUMA mirroring is active (else src0->data)
+    const char * const src0_data = (const char *) ggml_numa_tensor_data(src0, numa_node);
 
     const enum ggml_type type = src0->type;
 
@@ -17932,7 +19259,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 const int64_t i2 = i12;
                 const int64_t i3 = i13;
 
-                const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
+                const char * src0_row = src0_data + (0 + i02 * nb02 + i03 * nb03);
 
                 // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
                 //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
@@ -17982,6 +19309,11 @@ static int ggml_compute_forward_mul_mat(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // NUMA mirror: each thread reads its node-local copy of the weights (src0). Falls back
+    // to src0->data when mirroring is inactive / this tensor is not mirrored.
+    const int numa_node = ggml_numa_node_for_thread(ith, nth);
+    const void * src0_data = ggml_numa_tensor_data(src0, numa_node);
+
     const enum ggml_type type = src0->type;
 
     enum ggml_type           const vec_dot_type         = type_traits[type].vec_dot_type;
@@ -18017,7 +19349,7 @@ static int ggml_compute_forward_mul_mat(
     if (dst->type == GGML_TYPE_F32) {
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
-                    src0->type, src0->data, nb01,
+                    src0->type, src0_data, nb01,
                     src1->type, src1->data, nb11,
                     (float *)dst->data, nb1/sizeof(float), ith, nth)) return node_n;
     }
@@ -18085,7 +19417,7 @@ static int ggml_compute_forward_mul_mat(
         if (iqk_mul_mat_4d(ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, row_size*ne11, row_size*ne11*ne12,
                     nb2/sizeof(float), nb3/sizeof(float),
-                    src0->type, src0->data, nb01,
+                    src0->type, src0_data, nb01,
                     vec_dot_type, wdata, row_size,
                     (float *)dst->data, nb1/sizeof(float), ith, nth)) {
             if (!cgraph) return node_n;
@@ -18098,10 +19430,11 @@ static int ggml_compute_forward_mul_mat(
                 GGML_ASSERT(dst_next->type == GGML_TYPE_F32);
                 GGML_ASSERT(src0_next->ne[0] == ne00);
                 //if (ith == 0) printf("Fusing %s\n", src0_next->name);
+                const void * src0_next_data = ggml_numa_tensor_data(src0_next, numa_node);
                 if (!iqk_mul_mat_4d(src0_next->ne[1], ne11, ne00,
                     src0_next->ne[2], src0_next->ne[3], ne12, ne13, src0_next->nb[2], src0_next->nb[3], row_size*ne11, row_size*ne11*ne12,
                     dst_next->nb[2]/sizeof(float), dst_next->nb[3]/sizeof(float),
-                    src0_next->type, src0_next->data, src0_next->nb[1],
+                    src0_next->type, src0_next_data, src0_next->nb[1],
                     vec_dot_type, wdata, row_size,
                     (float *)dst_next->data, dst_next->nb[1]/sizeof(float), ith, nth)) break;
                 ++node_n;
@@ -18167,12 +19500,12 @@ static int ggml_compute_forward_mul_mat(
 
         // If there are more than three rows in src1, use gemm; otherwise, use gemv.
         if (gemm && (ne11 > 3)) {
-            gemm(ne00, (float *)((char *) dst->data) + src0_start, ne01, (const char *) src0->data + src0_start * nb01,
+            gemm(ne00, (float *)((char *) dst->data) + src0_start, ne01, (const char *) src0_data + src0_start * nb01,
                  (const char *) src1_wdata, ne11 - ne11 % 4, src0_end - src0_start);
         }
         for (int iter = gemm ? ne11 - ne11 % 4 : 0; iter < ne11; iter++) {
             gemv(ne00, (float *)((char *) dst->data + (iter * nb1)) + src0_start, ne01,
-                 (const char *) src0->data + src0_start * nb01, (const char *) src1_wdata + (src1_col_stride * iter), 1,
+                 (const char *) src0_data + src0_start * nb01, (const char *) src1_wdata + (src1_col_stride * iter), 1,
                  src0_end - src0_start);
         }
         return node_n;
@@ -18191,7 +19524,7 @@ static int ggml_compute_forward_mul_mat(
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
+        ggml_compute_forward_mul_mat_one_chunk(params, dst, numa_node, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
             break;
@@ -18217,6 +19550,10 @@ static void ggml_compute_forward_mul_mat_id(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    // NUMA mirror: node-local copy of the (stacked expert) weights for this thread
+    const int numa_node = ggml_numa_node_for_thread(ith, nth);
+    const char * const src0_data = (const char *) ggml_numa_tensor_data(src0, numa_node);
 
     const enum ggml_type type = src0->type;
 
@@ -18310,6 +19647,14 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+#if defined(__gnu_linux__)
+        if (g_numa_stats_level) {
+            ggml_numa_moe_stats_add(n_as, matrix_row_counts); // expert-routing census (E11)
+        }
+#endif
+        // expert -> node assignment for this op, published by the barrier below along with
+        // matrix_row_counts. No-op unless expert sharding + rebalancing are both on.
+        ggml_numa_moe_assign(n_as, matrix_row_counts, ggml_numa_node_count(), nth);
     }
 
     if (ith == 0) {
@@ -18320,7 +19665,7 @@ static void ggml_compute_forward_mul_mat_id(
 
 #if GGML_USE_IQK_MULMAT
 #if defined GGML_EXPERT_CHUNKING
-    if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
+    if (!ggml_numa_mirror_active() && ne13 == 1 && dst->type == GGML_TYPE_F32) {
         const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
 
@@ -18375,7 +19720,14 @@ IQK_MulMat_Not_Available0:;
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+        // expert-affinity sharding: skip experts owned by another node, and work within a
+        // node-local thread index for the ones we do own (no-op unless --numa-mirror dense)
+        int ith_e, nth_e;
+        if (!ggml_numa_expert_scope(cur_a, ith, nth, &ith_e, &nth_e)) {
+            continue;
+        }
+
+        const char * src0_cur = src0_data + cur_a*nb02;
 
         const void * wdata    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
@@ -18389,15 +19741,15 @@ IQK_MulMat_Not_Available0:;
                        src0->type, (const char *)src0_cur, nb01, ///ggml_type_size(src0->type),
                        vec_dot_type, (const char *)wdata, row_size, ///ggml_type_size(vec_dot_type),
                        (float *)dst->data, nb1, nb2,
-                       matrix_rows + cur_a*ne12, ith, nth)) goto IQK_MulMat_Not_Available;
+                       matrix_rows + cur_a*ne12, ith_e, nth_e)) goto IQK_MulMat_Not_Available;
                 continue;
         }
 IQK_MulMat_Not_Available:;
 #endif
 
         if (((ggml_n_dims(src0) - 1) == 2) && gemv) {
-            int64_t src0_cur_start = (ith * ne01) / nth;
-            int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
+            int64_t src0_cur_start = (ith_e * ne01) / nth_e;
+            int64_t src0_cur_end   = ((ith_e + 1) * ne01) / nth_e;
             src0_cur_start = (src0_cur_start % matmul_num_cols) ? src0_cur_start + matmul_num_cols - (src0_cur_start % matmul_num_cols): src0_cur_start;
             src0_cur_end   = (src0_cur_end % matmul_num_cols) ? src0_cur_end + matmul_num_cols - (src0_cur_end % matmul_num_cols): src0_cur_end;
             if (src0_cur_start >= src0_cur_end) return;
@@ -18424,8 +19776,8 @@ IQK_MulMat_Not_Available:;
         }
 
         if (((ggml_n_dims(src0) - 1) == 2) && gemv) {
-            int64_t src0_cur_start = (ith * ne01) / nth;
-            int64_t src0_cur_end   = ((ith + 1) * ne01) / nth;
+            int64_t src0_cur_start = (ith_e * ne01) / nth_e;
+            int64_t src0_cur_end   = ((ith_e + 1) * ne01) / nth_e;
             src0_cur_start = (src0_cur_start % matmul_num_cols) ? src0_cur_start + matmul_num_cols - (src0_cur_start % matmul_num_cols): src0_cur_start;
             src0_cur_end   = (src0_cur_end % matmul_num_cols) ? src0_cur_end + matmul_num_cols - (src0_cur_end % matmul_num_cols): src0_cur_end;
             if (src0_cur_start >= src0_cur_end) return;
@@ -18453,11 +19805,11 @@ IQK_MulMat_Not_Available:;
 
         // distribute the thread work across the inner or outer loop based on which one is larger
 
-        const int64_t nth0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        const int64_t nth1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+        const int64_t nth0 = nr0 > nr1 ? nth_e : 1; // parallelize by src0 rows
+        const int64_t nth1 = nr0 > nr1 ? 1 : nth_e; // parallelize by src1 rows
 
-        const int64_t ith0 = ith % nth0;
-        const int64_t ith1 = ith / nth0;
+        const int64_t ith0 = ith_e % nth0;
+        const int64_t ith1 = ith_e / nth0;
 
         const int64_t dr0 = (nr0 + nth0 - 1)/nth0;
         const int64_t dr1 = (nr1 + nth1 - 1)/nth1;
@@ -18544,6 +19896,13 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    // NUMA mirror: node-local copies of the up/gate expert weights (and optional biases)
+    const int numa_node = ggml_numa_node_for_thread(ith, nth);
+    const char * const src0_1_data = (const char *) ggml_numa_tensor_data(src0_1, numa_node);
+    const char * const src0_2_data = src0_2 ? (const char *) ggml_numa_tensor_data(src0_2, numa_node) : NULL;
+    const char * const up_b_data   = up_b   ? (const char *) ggml_numa_tensor_data(up_b,   numa_node) : NULL;
+    const char * const gate_b_data = gate_b ? (const char *) ggml_numa_tensor_data(gate_b, numa_node) : NULL;
 
     const enum ggml_type type = src0->type;
 
@@ -18639,44 +19998,54 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                 matrix_row_counts[i02] += 1;
             }
         }
+#if defined(__gnu_linux__)
+        if (g_numa_stats_level) {
+            ggml_numa_moe_stats_add(n_as, matrix_row_counts); // expert-routing census (E11)
+        }
+#endif
+        // expert -> node assignment for this op, published by the barrier below along with
+        // matrix_row_counts. No-op unless expert sharding + rebalancing are both on.
+        ggml_numa_moe_assign(n_as, matrix_row_counts, ggml_numa_node_count(), nth);
     }
 
 #if defined GGML_EXPERT_CHUNKING
+    // Global chunk stealing bypasses node-local weights and expert ownership.
+    if (!ggml_numa_mirror_active()) {
 
-    if (ith == 0) {
-        atomic_store(&params->shared->current_chunk, nth);
-    }
-
-    ggml_barrier(params->shared);
-
-    const float limit = *(const float *)(dst->op_params + 1);
-
-    const void * wdata_ug    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-    const size_t row_size_ug = ggml_row_size(vec_dot_type, ne10);
-    const int64_t nr0_base = src0_2 ? ne01 : ne01/2;
-
-    const int chunks_per_expert_ug = MAX(1, MIN(nth, (int)(nr0_base / 32)));
-
-    int total_chunks_ug = 0;
-    for (int a = 0; a < n_as; a++) {
-        if (matrix_row_counts[a] > 0) total_chunks_ug += chunks_per_expert_ug;
-    }
-
-    int last_a = 0;
-    int last_acc = 0;
-    int chunk_id_ug = ith;
-    while (chunk_id_ug < total_chunks_ug) {
-        int acc = last_acc, cur_a = -1, local_chunk = 0;
-        for (int a = last_a; a < n_as; a++) {
-            if (matrix_row_counts[a] == 0) continue;
-            if (chunk_id_ug < acc + chunks_per_expert_ug) {
-                cur_a = a;
-                local_chunk = chunk_id_ug - acc;
-                break;
-            }
-            acc += chunks_per_expert_ug;
+        if (ith == 0) {
+            atomic_store(&params->shared->current_chunk, nth);
         }
-        if (cur_a < 0) {
+
+        ggml_barrier(params->shared);
+
+        const float limit = *(const float *)(dst->op_params + 1);
+
+        const void * wdata_ug    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+        const size_t row_size_ug = ggml_row_size(vec_dot_type, ne10);
+        const int64_t nr0_base = src0_2 ? ne01 : ne01/2;
+
+        const int chunks_per_expert_ug = MAX(1, MIN(nth, (int)(nr0_base / 32)));
+
+        int total_chunks_ug = 0;
+        for (int a = 0; a < n_as; a++) {
+            if (matrix_row_counts[a] > 0) total_chunks_ug += chunks_per_expert_ug;
+        }
+
+        int last_a = 0;
+        int last_acc = 0;
+        int chunk_id_ug = ith;
+        while (chunk_id_ug < total_chunks_ug) {
+            int acc = last_acc, cur_a = -1, local_chunk = 0;
+            for (int a = last_a; a < n_as; a++) {
+                if (matrix_row_counts[a] == 0) continue;
+                if (chunk_id_ug < acc + chunks_per_expert_ug) {
+                    cur_a = a;
+                    local_chunk = chunk_id_ug - acc;
+                    break;
+                }
+                acc += chunks_per_expert_ug;
+            }
+            if (cur_a < 0) {
             return;
         }
         last_a = cur_a;
@@ -18708,7 +20077,9 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         chunk_id_ug = atomic_fetch_add(&params->shared->current_chunk, 1);
     }
 
-#else
+        return;
+    }
+#endif
 
     ggml_barrier(params->shared);
 
@@ -18724,18 +20095,25 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
             continue;
         }
 
+        // expert-affinity sharding: skip experts owned by another node, and work within a
+        // node-local thread index for the ones we do own (no-op unless --numa-mirror dense)
+        int ith_e, nth_e;
+        if (!ggml_numa_expert_scope(cur_a, ith, nth, &ith_e, &nth_e)) {
+            continue;
+        }
+
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
-            up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
-            gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
+            src0_1_cur = src0_1_data + cur_a*nb02;
+            src0_2_cur = src0_2_data + cur_a*nb02;
+            up_b_cur   = up_b   ? up_b_data   + cur_a*nb41 : NULL;
+            gate_b_cur = gate_b ? gate_b_data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+            src0_2_cur = src0_1_data + cur_a*nb02;
             src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
-                gate_b_cur = (const char *)up_b->data + cur_a*nb41;
+                gate_b_cur = up_b_data + cur_a*nb41;
                 up_b_cur   = gate_b_cur + nb41/2;
             }
         }
@@ -18751,10 +20129,10 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             vec_dot_type, (const char *)wdata, row_size,
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
-                            matrix_rows + cur_a*ne12, limit, ith, nth)) GGML_ABORT("fatal error");
+                            matrix_rows + cur_a*ne12, limit, ith_e, nth_e)) GGML_ABORT("fatal error");
 
     }
-#endif
+
 #undef MMID_MATRIX_ROW
 }
 
@@ -18777,6 +20155,11 @@ static void ggml_compute_forward_mul_mat_up_gate(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    // NUMA mirror: node-local copies of the up/gate weights for this thread
+    const int numa_node = ggml_numa_node_for_thread(ith, nth);
+    const void * const src0_1_data = ggml_numa_tensor_data(src0_1, numa_node);
+    const void * const src0_2_data = ggml_numa_tensor_data(src0_2, numa_node);
 
     const enum ggml_type type = src0->type;
 
@@ -18821,7 +20204,7 @@ static void ggml_compute_forward_mul_mat_up_gate(
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
     if (!iqk_moe_fused_up_gate(ne01, ne11, ne00, ne11, dst->op_params[0],
-                         type, src0_1->data, src0_2->data, nb01,
+                         type, src0_1_data, src0_2_data, nb01,
                          vec_dot_type, (const char *)wdata, row_size,
                          NULL, NULL,
                          (float *)dst->data, nb1, nb2,
@@ -19710,7 +21093,7 @@ static void ggml_compute_forward_get_rows_q(
         //assert(i01 >= 0 && i01 < ne01);
 
         dequantize_row_q(
-                (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+                (const void *) ((const char *) ggml_numa_tensor_data(src0, ggml_numa_node_for_thread(params->ith, params->nth)) + i01*nb01 + i11*nb02 + i12*nb03),
                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -19750,7 +21133,7 @@ static void ggml_compute_forward_get_rows_f16(
 
         if (i01 >= 0 && i01 < ne01) {
             ggml_fp16_to_fp32_row(
-                    (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+                    (const void *) ((const char *) ggml_numa_tensor_data(src0, ggml_numa_node_for_thread(params->ith, params->nth)) + i01*nb01 + i11*nb02 + i12*nb03),
                          (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
         } else {
             memset((char *) dst->data + i10*nb1  + i11*nb2  + i12*nb3, 0, nc*sizeof(float));
@@ -19794,7 +21177,7 @@ static void ggml_compute_forward_get_rows_bf16(
 
         if (i01 >= 0 && i01 < ne01) {
             ggml_bf16_to_fp32_row(
-                    (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+                    (const void *) ((const char *) ggml_numa_tensor_data(src0, ggml_numa_node_for_thread(params->ith, params->nth)) + i01*nb01 + i11*nb02 + i12*nb03),
                          (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
         } else {
             memset((char *) dst->data + i10*nb1  + i11*nb2  + i12*nb3, 0, nc*sizeof(float));
@@ -19838,7 +21221,7 @@ static void ggml_compute_forward_get_rows_f32(
         if (i01 >= 0 && i01 < ne01) {
             ggml_vec_cpy_f32(nc,
                     (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                    (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+                    (float *) ((char *) ggml_numa_tensor_data(src0, ggml_numa_node_for_thread(params->ith, params->nth)) + i01*nb01 + i11*nb02 + i12*nb03));
         } else {
             memset((char *)dst->data + i10*nb1  + i11*nb2  + i12*nb3, 0, nc*sizeof(float));
         }
@@ -23001,6 +24384,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // NUMA mirror: read K/V from this thread's node-local copy (k/v are views of the mirrored
+    // k_l/v_l cache tensors; falls back to ->data when KV mirroring is inactive).
+    const int numa_node = ggml_numa_node_for_thread(ith, nth);
+    const void * const k_base = ggml_numa_tensor_data(k, numa_node);
+    const void * const v_base = ggml_numa_tensor_data(v, numa_node);
+
     const int64_t Dk = nek0;
     const int64_t Dv = nev0;
     const int64_t N  = neq1;
@@ -23068,7 +24457,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 dst->ne[2], dst->ne[1], dst->nb[1],
                 k->type, v->type,
                 Dk, Dv, neq1, nek1, q->nb[1], k->nb[1], v->nb[1], mask ? mask->nb[1] : 0,
-                q->data, k->data, v->data, mask ? mask->data : NULL, sinks ? sinks->data : NULL,
+                q->data, k_base, v_base, mask ? mask->data : NULL, sinks ? sinks->data : NULL,
                 scale, softcap, (float *)dst->data,
                 params->wdata, (barrier_t)ggml_barrier, (void *)params->shared, ith, nth, dst->op_params[4],
                 dst->src[5])) return;
@@ -23179,7 +24568,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
             float s; // KQ value
 
-            const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+            const char * k_data = (const char *) k_base + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
             kq_vec_dot(Dk, &s, 0, k_data, 0, Q_q, 0, 1);
 
             s = softcap == 0.0f ? s*scale + mv : softcap*tanhf(s*scale) + mv; // scale KQ value and apply mask
@@ -23189,7 +24578,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
             float vs = 1.0f; // post-softmax KQ value, expf(s - M)
 
-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+            const char * v_data = ((const char *) v_base + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
             if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
@@ -28556,7 +29945,7 @@ typedef int ggml_lock_t;
 
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
-static void set_numa_thread_affinity(int thread_n) {
+static void set_numa_thread_affinity(int thread_n, int n_threads) {
     if (!ggml_is_numa()) {
         return;
     }
@@ -28574,6 +29963,12 @@ static void set_numa_thread_affinity(int thread_n) {
             // run thread on current_node
             node_num = g_state.numa.current_node;
             break;
+        case GGML_NUMA_STRATEGY_MIRROR:
+            // block-split threads across nodes; must match ggml_numa_node_for_thread()
+            // used to pick the node-local weight copy during compute.
+            node_num = ggml_numa_node_for_thread(thread_n, n_threads);
+            tl_numa_node = node_num; // remember our node for the hierarchical barrier
+            break;
         case GGML_NUMA_STRATEGY_NUMACTL:
             // use the cpuset that numactl gave us
             rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
@@ -28589,8 +29984,31 @@ static void set_numa_thread_affinity(int thread_n) {
 
     cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
     CPU_ZERO_S(setsize, cpus);
-    for (size_t i = 0; i < node->n_cpus; ++i) {
-        CPU_SET_S(node->cpus[i], setsize, cpus);
+
+    // GGML_NUMA_PIN=cpu (mirror only): pin this thread to one specific CPU of its node so the
+    // scheduler can't migrate it across CCDs and drag its working set between L3 caches.
+    // Threads take the node's allowed CPUs in sysfs order (physical cores before SMT siblings);
+    // CPUs outside the process's original affinity mask (numactl/cgroup) are skipped.
+    bool pinned_single = false;
+    if (g_state.numa.pin_cpu && g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_MIRROR) {
+        const int first = ggml_numa_node_first_thread(node_num, n_threads); // first thread of this node's block
+        const int local = thread_n - first;
+        uint32_t allowed[GGML_NUMA_MAX_CPUS];
+        uint32_t n_allowed = 0;
+        for (uint32_t i = 0; i < node->n_cpus; ++i) {
+            if (CPU_ISSET(node->cpus[i], &g_state.numa.cpuset)) {
+                allowed[n_allowed++] = node->cpus[i];
+            }
+        }
+        if (n_allowed > 0 && local >= 0) {
+            CPU_SET_S(allowed[local % n_allowed], setsize, cpus);
+            pinned_single = true;
+        }
+    }
+    if (!pinned_single) {
+        for (size_t i = 0; i < node->n_cpus; ++i) {
+            CPU_SET_S(node->cpus[i], setsize, cpus);
+        }
     }
 
     rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
@@ -28624,7 +30042,7 @@ static void clear_numa_thread_affinity(void) {
 #else
 // TODO: Windows etc.
 // (the linux implementation may also work on BSD, someone should test)
-static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
+static void set_numa_thread_affinity(int thread_n, int n_threads) { UNUSED(thread_n); UNUSED(n_threads); }
 static void clear_numa_thread_affinity(void) {}
 #endif
 
@@ -29125,7 +30543,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cgraph * cgraph = state->shared->cgraph;
     const struct ggml_cplan  * cplan  = state->shared->cplan;
 
-    set_numa_thread_affinity(state->ith);
+    set_numa_thread_affinity(state->ith, state->shared->n_threads);
 
     struct ggml_compute_params params = {
         /*.ith   =*/ state->ith,
@@ -29204,6 +30622,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
                 state_shared.n_threads = n_threads;
+                // configure the NUMA-aware barrier for this thread count (single-threaded here;
+                // the implicit barrier ending this 'single' publishes it to all workers)
+                ggml_numa_barrier_setup(n_threads);
             }
 
             struct ggml_compute_state worker = {
@@ -29235,6 +30656,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             .shared = &state_shared,
         };
     }
+
+    ggml_numa_barrier_setup(n_threads); // configure NUMA-aware barrier before workers start
 
     // create thread pool
     for (int j = 1; j < n_threads; ++j) {

@@ -408,6 +408,15 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_FC            = auto()
     DFLASH_HIDDEN_NORM   = auto()
     DFLASH_AUX_HIDDEN_NORM = auto()
+    # openPangu-2.0 (DSA lightning indexer). Distinct members from the GLM-DSA INDEXER_*
+    # above: TENSOR_NAMES is a flat dict, so one member cannot carry two GGUF names, and
+    # openPangu writes blk.N.attn_indexer_* where GLM-DSA writes blk.N.indexer.* (see the
+    # per-arch maps in llama-model.cpp). The HF-side names are disambiguated separately in
+    # tensor_mapping.py's arch_block_mappings_cfg.
+    PANGU_INDEXER_K_NORM   = auto()
+    PANGU_INDEXER_PROJ     = auto()   # weights_proj
+    PANGU_INDEXER_ATTN_K   = auto()   # wk
+    PANGU_INDEXER_ATTN_Q_B = auto()   # wq_b
     DSPARK_MARKOV_W1     = auto() # DSpark Markov lookup matrix
     DSPARK_MARKOV_W2     = auto() # DSpark Markov projection matrix
     DSPARK_CONF_PROJ     = auto() # DSpark confidence projection
@@ -659,10 +668,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
     # openPangu-2.0
-    MODEL_TENSOR.INDEXER_K_NORM:            "blk.{bid}.attn_indexer_k_norm",
-    MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.attn_indexer_weights_proj",
-    MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.attn_indexer_k",
-    MODEL_TENSOR.INDEXER_ATTN_Q_B:          "blk.{bid}.attn_indexer_q_b",
+    MODEL_TENSOR.PANGU_INDEXER_K_NORM:      "blk.{bid}.attn_indexer_k_norm",
+    MODEL_TENSOR.PANGU_INDEXER_PROJ:        "blk.{bid}.attn_indexer_weights_proj",
+    MODEL_TENSOR.PANGU_INDEXER_ATTN_K:      "blk.{bid}.attn_indexer_k",
+    MODEL_TENSOR.PANGU_INDEXER_ATTN_Q_B:    "blk.{bid}.attn_indexer_q_b",
     MODEL_TENSOR.ATTN_QA_CONV:              "blk.{bid}.attn_qa_conv",
     MODEL_TENSOR.ATTN_KV_CONV:              "blk.{bid}.attn_compresskv_conv",
     MODEL_TENSOR.ATTN_O_CONV:               "blk.{bid}.attn_o_conv",
@@ -1502,10 +1511,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.ATTN_POST_NORM,   # post_attention_layernorm (sandwich)
         # DSA lightning indexer
-        MODEL_TENSOR.INDEXER_K_NORM,
-        MODEL_TENSOR.INDEXER_PROJ,
-        MODEL_TENSOR.INDEXER_ATTN_K,
-        MODEL_TENSOR.INDEXER_ATTN_Q_B,
+        MODEL_TENSOR.PANGU_INDEXER_K_NORM,
+        MODEL_TENSOR.PANGU_INDEXER_PROJ,
+        MODEL_TENSOR.PANGU_INDEXER_ATTN_K,
+        MODEL_TENSOR.PANGU_INDEXER_ATTN_Q_B,
         # MoME causal convs + param sink
         MODEL_TENSOR.ATTN_QA_CONV,
         MODEL_TENSOR.ATTN_KV_CONV,

@@ -272,7 +272,8 @@ create_tensors_helper::create_tensors_helper(llama_model_loader & _ml, llama_mod
     }
 
     if (ml.ncmoe > 0) {
-        auto buft = llama_default_buffer_type_cpu(true);
+        // CPU expert weights stay pageable for NUMA placement; only activations cross to the GPU.
+        auto buft = ggml_backend_cpu_buffer_type();
         if (model.split_mode == LLAMA_SPLIT_MODE_ATTN || model.split_mode == LLAMA_SPLIT_MODE_GRAPH || ml.ncmoe >= n_layer || model.devices.size() < 2) {
             const auto tn = LLM_TN(model.arch);
             int last_layer = n_layer - model.hparams.nextn_predict_layers;

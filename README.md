@@ -1,3 +1,264 @@
+# NUMA-mirrored ik_llama.cpp
+
+This is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — itself a
+performance-focused fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) (see the
+original README below) — that adds a **`--numa mirror`** mode for fast CPU inference on
+multi-socket / multi-NUMA-node servers.
+
+## What it does
+
+On a multi-socket machine, plain CPU inference scales poorly: the model weights live on one
+NUMA node, so threads running on another socket read them *remotely* over the inter-socket
+link (UPI / Infinity Fabric). That cross-socket traffic becomes the bottleneck — adding the
+second socket's cores often gives little speedup, and can even make **token generation
+slower** than using a single socket.
+
+`--numa mirror` fixes this by keeping one **full, node-local copy** of the read-mostly data
+on **every NUMA node**:
+
+- **Model weights** are duplicated once per node.
+- **The KV cache** is duplicated once per node (writes are replicated to all copies; reads
+  stay local).
+- **Inference threads are pinned per node** and only ever touch their node-local copies, so
+  no model data is read across the inter-socket link.
+- A **NUMA-aware hierarchical barrier** keeps the per-op thread synchronization (otherwise a
+  major cross-socket cost during token generation) from becoming the new bottleneck.
+
+Each socket then runs at its full *local* memory bandwidth, so a multi-socket box can
+actually put all of its sockets to work. The gain is largest for **token generation**
+(memory-bandwidth bound) and more modest for prompt processing (compute bound).
+
+The trade-off is memory: mirroring uses **N× RAM** (N = number of NUMA nodes), so the model
+has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`.
+
+## How to use it
+
+```
+# auto-detect the NUMA nodes and mirror weights + KV across all of them
+./build/bin/llama-cli -m model.gguf --numa mirror -t <total physical cores> -p "..."
+```
+
+- `--numa mirror` works in every tool that supports `--numa` (`llama-cli`, `llama-server`,
+  `llama-bench`, …).
+- `--numa-mirror <list>` selects *what* to mirror: `weights`, `kv`, `dense`, `all` (default) or
+  `none` — e.g. `--numa-mirror weights` to mirror only the weights. This component selector is
+  available in the main tools (`llama-cli`, `llama-server`, …); `llama-bench` accepts
+  `--numa mirror` only and always mirrors everything (`weights` + `kv`).
+- `--numa-mirror dense,kv` is **expert-affinity sharding** for MoE models too large to
+  duplicate — see below.
+- **Requirements:** Linux, more than one NUMA node, and enough RAM to hold the model N times.
+  For best results, disable kernel auto-balancing:
+  `echo 0 | sudo tee /proc/sys/kernel/numa_balancing`.
+- **Thread count:** token generation is memory-bandwidth bound and may peak *below* the full
+  physical-core count; it can be worth sweeping `-t` to find the sweet spot for your machine.
+
+See [`examples/main/README.md`](examples/main/README.md) for the full list of `--numa` modes.
+
+### Expert-affinity sharding — `--numa-mirror dense,kv` (MoE models that can't be mirrored)
+
+Mirroring costs `weights × n_nodes`, so a ~1.5 TB MoE needs ~3 TB to mirror on two nodes and
+simply does not fit. `dense` mirrors everything **except** the routed-expert tensors; those keep
+a **single copy**, with expert `e` pinned to node `e % n_nodes`. The footprint becomes
+`dense × n_nodes + experts × 1`. The MoE kernels then compute expert `e` only on that node's
+threads, so the weight reads stay node-local.
+
+```
+# mirror attention/router/embeddings, shard the experts one copy per node
+./build/bin/llama-server -m big-moe.gguf --numa-mirror dense,kv -t <total physical cores> ...
+```
+
+- Output is **bit-identical** to a mirrored or non-NUMA run — sharding changes placement and
+  scheduling, never arithmetic. Each `(token, expert)` writes a disjoint slot, so no cross-node
+  reduction is involved.
+- Shared experts (`*_shexp`) and `ffn_norm_exps` stay mirrored: they are read on every token by
+  every thread. Only `ffn_{up,gate,gate_up,down}_exps` are sharded.
+- Implies `--no-mmap` (as all mirror modes do). It is additionally required here because expert
+  placement uses `mbind(MPOL_MF_MOVE)`, which cannot relocate the page-cache pages behind a
+  file mapping.
+- **Cost — routing imbalance.** Every MoE op ends at a barrier, so it runs at the speed of
+  whichever node drew more of the routed rows. With `GGML_NUMA_STATS=1` the run reports
+  `moe_node_skew_mean` / `moe_node_skew_max`: `1.00` is a perfect split, `2.00` means one node
+  did everything while the other idled. Measured on the fake-NUMA testbed:
+
+  | model | TG (batch 1) | PP (batch 512) |
+  |---|---|---|
+  | Qwen1.5-MoE-A2.7B | `1.32` mean, `2.00` max | `1.07` mean, `1.41` max |
+  | gemma-4-26B-A4B | `1.25` mean, `2.00` max | — |
+
+  So prompt processing averages out, while token generation gives up roughly 25–35% to
+  imbalance. The skew counter is computed whether or not sharding is enabled, so a plain
+  `--numa mirror` run can predict what sharding would cost on a given model before you commit
+  to it. Use `dense` when the model does not fit otherwise, not as a speedup over mirroring.
+- Cumulative per-node totals (`moe_experts=` in the stats) average out to ~1.01 over a run and
+  will look perfectly balanced — they are not the number that matters; `moe_node_skew_mean` is.
+
+**Rebalancing the skew away — `GGML_NUMA_SHARD_STEAL=1`** (default off, pending on-target
+calibration). Each MoE op re-derives its expert→node assignment from the routing counts every
+thread already has, so an idle node takes work off a busy one instead of waiting at the barrier.
+Because the assignment is a deterministic function of data every thread sees, it needs no
+atomics and no extra barrier, and each expert is still computed in full by one node — so
+**output stays bit-identical**.
+
+Moving an expert off its owner makes its weight reads remote, so a move only pays when the busy
+node sheds more than the idle node takes on. That tradeoff is the `GGML_NUMA_SHARD_STEAL_COST`
+ratio `r`. The algorithm is self-limiting: at high `r` it declines to move at all. Measured on
+the testbed (`skew_after`, remote penalty included):
+
+| `r` | Qwen1.5-MoE | gemma-4-26B |
+|---|---|---|
+| 1.0 | 1.34 → **1.00** | 1.25 → **1.00** |
+| 1.3 | → 1.05 | → 1.04 |
+| 1.5 (default) | → 1.09 | → 1.07 |
+| 2.0 | → 1.24 | → 1.13 |
+
+Set `r` from your own hardware before relying on it — a value set too low over-moves and pays
+more in remote reads than it saves in idle. Get it with the `GGML_NUMA_SHARD_SCHED=0` A/B
+described in that knob's row.
+
+### Hybrid NUMA-GPU Execution (MoE Models)
+
+For Mixture-of-Experts (MoE) models, you can run a **Hybrid NUMA-GPU** setup where you offload dense layers (like attention and early/late transformations) to your GPU, while leaving the massive MoE experts to run across all of your CPU's NUMA nodes using the `--numa mirror` strategy.
+
+To reduce cross-socket traffic when the CPU communicates with the GPU, add `--numa-gpu-node N`, where `N` is the NUMA node your GPU is attached to (check with `nvidia-smi topo -m`):
+```
+# Example: GPU is attached to NUMA node 1.
+./build/bin/llama-server -m model.gguf --numa mirror --numa-gpu-node 1 -ngl 999 --cpu-moe ...
+```
+- **What it does**: `-ngl 999` attempts to offload all layers to the GPU, but `--cpu-moe` overrides this to keep all MoE experts on the CPU. `--numa-gpu-node N` binds the non-mirrored host-side buffers to node `N`, so host memory the GPU interacts with sits on the socket the GPU is attached to. It is purely a memory-placement hint and does not change how compute is scheduled.
+- **MoE Experts**: The MoE experts (and any other CPU-resident layers) still fully utilize the `--numa mirror` strategy and execute across *all* available NUMA nodes for maximum speed — model output is identical with or without `--numa-gpu-node`.
+- **`--numa-bind-compute`** (experimental, requires `--numa-gpu-node`): additionally binds the CPU compute buffers — the intermediate tensor data the GPU DMAs from/to every layer — to the GPU's node. This makes GPU transfers node-local at the cost of remote writes from expert threads on the other node(s); whether it nets positive depends on the workload, so A/B it. 
+	See [`docs/numa-tuning.md`](docs/numa-tuning.md) for the measurement guide and [`scripts/numa-ab.py`](scripts/numa-ab.py) for a harness that automates the comparison.
+
+**Maximizing Performance with Excess VRAM**
+GPU compute is significantly faster than CPU compute, even with NUMA mirroring. If you have VRAM left over after offloading the dense layers, you should offload as many MoE experts as will fit.
+- You can achieve this by dropping `--cpu-moe` and using `--n-cpu-moe N` (where `N` is the number of MoE layers to leave on the CPU, pushing the rest to the GPU).
+- Alternatively, simply omit `--cpu-moe` entirely and use `-ngl X` where `X` is a specific number of total layers that fills your GPU VRAM to capacity without overflowing.
+
+## Tuning knobs, diagnostics & validation tooling
+
+Beyond the flags above, the fork ships runtime-tunable knobs (all env vars, all inert at
+their defaults) plus the tooling to pick their values for a specific machine:
+
+| Env var | Default | What it does |
+|---|---|---|
+| `GGML_NUMA_PIN` | cpu | `cpu` pins each mirror thread to one specific CPU (stops cross-CCD L3 migration) |
+| `GGML_NUMA_HIER_BATCH_MAX` | 32 | batches above this use the flat barrier instead of the NUMA-hierarchical one; negative = always hierarchical |
+| `GGML_NUMA_RESERVE_CPUS` | unset | `N[@node]` excludes N CPUs of a node from compute pinning so unpinned threads (CUDA driver, scheduler) get dedicated cores; the thread split rebalances by CPU count automatically |
+| `GGML_NUMA_EXCLUDE_CPUS` | unset | `list` of CPU cores (e.g. `0,1-3,6`) completely excluded from NUMA pinning (and thus omitted from compute scheduling). Can also be set via `--numa-exclude-cpus` |
+| `GGML_NUMA_COPY_THREADS` | 16 | threads for the dest-pinned parallel mirror-populate copy |
+| `GGML_NUMA_COPY_MIN_MB` | 64 | below this size a single memcpy is used |
+| `GGML_NUMA_NT_COPY` | off | `1` = non-temporal (streaming) stores for the explicit cross-node copies |
+| `GGML_NUMA_HUGETLB` | off | `1` = back mirror allocations with explicit 2 MiB hugetlb pages (needs `vm.nr_hugepages`; falls back to THP) |
+| `GGML_NUMA_SHARD_STEAL` | off | with `--numa-mirror dense`, `1` rebalances each MoE op's experts across nodes when routing lands lopsided (see below). Output stays bit-identical |
+| `GGML_NUMA_SHARD_STEAL_COST` | 1.5 | the remote-read penalty ratio `r` used by that rebalancer: how much slower an expert is when computed off its owner node. Measure it with `GGML_NUMA_SHARD_SCHED=0` before trusting the default |
+| `GGML_NUMA_SHARD_SCHED` | 1 | with `--numa-mirror dense`, `0` keeps expert placement but restores the old schedule (every node computes every expert, ~half the reads remote). Measurement only: paired against `--numa mirror` it isolates the remote-read penalty on your hardware |
+| `GGML_NUMA_STATS` | off | `1` = dump mirror-path counters at exit (incl. a per-expert MoE routing census and `moe_node_skew_*`); `2` = also per `llama_print_timings` |
+| `GGML_NUMA_FAKE` | unset | testbed only: fabricate N NUMA nodes on a 1-node box (see `docs/numa-testbed.md`) |
+| `GGML_NUMA_XGMI_GBPS` | unset | testbed only: cap explicit cross-node copies to model the socket interconnect |
+
+**Automatic waiting policy:** with `--numa mirror` + GPU offload, the tools default
+`OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=7000`, based on user testing on Pandora (2026-09-07). Setting either variable yourself disables the auto-default. This is a spin count, not a timeout in milliseconds. Mirror workers default to individual CPU pinning; set `GGML_NUMA_PIN=node` to restore node-wide affinity.
+
+**Pick values for your machine** with `scripts/pandora-tune.sh` — one subcommand per
+knob, each prints the winning value and where to apply it (`census` first: it verifies
+mirroring actually engaged and reports MoE expert-routing skew). `scripts/tune-spincount.sh`
+sweeps the waiting-policy spin count. Full run order, per-knob guidance, and sizing notes
+for ~500 GB models: [`docs/numa-tuning.md`](docs/numa-tuning.md). Local development uses
+the fake-NUMA Docker testbed with measured experiment verdicts:
+[`docs/numa-testbed.md`](docs/numa-testbed.md).
+
+# NUMA mode benchmarks
+
+How much does **`--numa mirror`** speed up CPU inference on a dual-socket server, versus
+running on a single socket?
+
+The baseline here is `--numa isolate` (run entirely on one socket). When a model fits in a
+single NUMA node's RAM — which every model below does on this machine (384 GB/node) —
+`isolate` is the usual recommended mode, because it keeps all memory access node-local.
+(`--numa distribute` exists for models too large to fit in one node; that's not the case
+here, so it isn't included.) `mirror` keeps a full local copy of the weights and KV cache on
+*each* node, so both sockets can run while still reading only local memory.
+
+## Test setup
+
+- **Operating System:**
+  - Debian 13 "Trixie" with `numa_balancing` disabled during benchmarking
+- **Hardware:**
+  - Model: Dell PowerEdge R740
+  - CPU: 2× Intel Xeon Gold 6248R (Cascade Lake), 2 NUMA nodes (24 cores /  48 threads each)
+  - RAM: 768 GB RAM (384 GB per node) ECC DDR4 2400 MHz, all 12 memory channels populated
+- **Build:** CPU backend, `Release`, `-DGGML_NATIVE=ON -DGGML_AVX512=ON
+  -DGGML_AVX512_VNNI=ON`. (VBMI/BF16 are **not** enabled — Cascade Lake does not implement
+  `avx512_vbmi` / `avx512_bf16`.)
+- **Tool:** `llama-bench`, 3 repetitions per result (`-r 3`).
+- **Per-run flags:** `-rtr 1 -b 16 -ub 16 -p 512 -n 128` (run-time repacking on; batch and
+  micro-batch 16; `pp512` = prompt processing of 512 tokens, `tg128` = generation of 128).
+- **Modes compared** (threads set equal for `-t`/`-tb`):
+  - `isolate` — `--numa isolate -t 24 -tb 24` (one socket / 24 cores) — single-socket baseline
+  - `mirror`  — `--numa mirror  -t 48 -tb 48` (both sockets, weights + KV duplicated per node)
+
+All throughput numbers are tokens/second (higher is better).
+
+## Token generation (tg128)
+
+| Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
+|---|--:|--:|--:|
+| gemma-4-E2B (dense, Q5_K_M) | 47.20 | **62.00** | 1.31× |
+| gemma-4-E4B (dense, Q5_K_M) | 23.77 | **33.62** | 1.41× |
+| gemma-4-26B-A4B (MoE, UD-Q4_K_M) | 23.59 | **34.76** | 1.47× |
+| Qwen3.6-27B (dense, Q4_K_M) | 5.27 | **8.32** | 1.58× |
+| Qwen3.6-35B-A3B (MoE, UD-Q5_K_M) | 24.70 | **31.56** | 1.28× |
+| Qwen3.5-122B-A10B (MoE, UD-Q3_K_XL) | 10.00 | **14.46** | 1.45× |
+
+## Prompt processing (pp512)
+
+| Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
+|---|--:|--:|--:|
+| gemma-4-E2B (dense, Q5_K_M) | 259.90 | **256.69** | 0.99× |
+| gemma-4-E4B (dense, Q5_K_M) | 141.88 | **184.06** | 1.30× |
+| gemma-4-26B-A4B (MoE, UD-Q4_K_M) | 143.41 | **201.69** | 1.41× |
+| Qwen3.6-27B (dense, Q4_K_M) | 33.04 | **54.22** | 1.64× |
+| Qwen3.6-35B-A3B (MoE, UD-Q5_K_M) | 153.68 | **193.21** | 1.26× |
+| Qwen3.5-122B-A10B (MoE, UD-Q3_K_XL) | 57.17 | **83.01** | 1.45× |
+
+## Takeaways
+
+- **`mirror` puts the second socket to work.** Across dense and MoE models (3.4 GB → 53 GB),
+  it beats a single socket on every model for both metrics — the lone exception being prompt
+  processing on the tiny 3.4 GB gemma-E2B, where one socket already saturates and the two are
+  effectively tied.
+- **Token generation: ~1.3–1.6× `isolate`.** TG is memory-bandwidth bound; mirroring lets
+  each socket pull from its own local memory, so aggregate bandwidth (and throughput) scales
+  with the second socket instead of being capped by it.
+- **Prompt processing: ~1.0–1.65× `isolate`.** PP is more compute-bound (it amortizes weight
+  reads across the batch), so the gain is generally smaller than TG, but still a solid win on
+  the larger models where there's enough work to feed both sockets.
+- **Trade-off:** `mirror` keeps one copy of the weights + KV cache per NUMA node, i.e.
+  **N× RAM** (here 2×). It's the right mode when the model fits a node's RAM with room to
+  spare; if it doesn't, that's the case `--numa distribute` is for.
+
+### Raw `llama-bench` output
+
+Each run used `-rtr 1 -b 16 -ub 16 -p 512 -n 128 -r 3` with the mode-specific `--numa` and
+`-t` settings above.
+
+| Model | Mode | pp512 (t/s) | tg128 (t/s) |
+|---|---|--:|--:|
+| gemma-4-E2B | isolate | 259.90 ± 5.94 | 47.20 ± 0.01 |
+| gemma-4-E2B | mirror | 256.69 ± 7.32 | 62.00 ± 0.13 |
+| gemma-4-E4B | isolate | 141.88 ± 0.86 | 23.77 ± 0.05 |
+| gemma-4-E4B | mirror | 184.06 ± 8.21 | 33.62 ± 0.21 |
+| gemma-4-26B-A4B | isolate | 143.41 ± 1.42 | 23.59 ± 0.00 |
+| gemma-4-26B-A4B | mirror | 201.69 ± 30.30 | 34.76 ± 0.68 |
+| Qwen3.6-27B | isolate | 33.04 ± 0.17 | 5.27 ± 0.00 |
+| Qwen3.6-27B | mirror | 54.22 ± 0.73 | 8.32 ± 0.02 |
+| Qwen3.6-35B-A3B | isolate | 153.68 ± 1.33 | 24.70 ± 0.01 |
+| Qwen3.6-35B-A3B | mirror | 193.21 ± 4.91 | 31.56 ± 0.08 |
+| Qwen3.5-122B-A10B | isolate | 57.17 ± 0.10 | 10.00 ± 0.00 |
+| Qwen3.5-122B-A10B | mirror | 83.01 ± 1.32 | 14.46 ± 0.01 |
+
+---
+
 # ik_llama.cpp: llama.cpp fork with better CPU performance
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)

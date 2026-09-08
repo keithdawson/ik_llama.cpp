@@ -1,0 +1,28 @@
+{
+  "name": "gpu-hybrid-mirror-vs-off",
+  "binary": "/build/cuda/bin/llama-cli",
+  "model": "/models/Qwen1.5-MoE-A2.7B-Chat.IQ4_XS.gguf",
+  "prompt_file": "/src/scripts/testbed/prompts/pp-long.txt",
+  "n_predict": 64,
+  "threads": 8,
+  "reps": 4,
+  "warmup": 1,
+  "common_args": ["-c", "4096", "--no-display-prompt",
+                  "-ngl", "99", "-ot", "exps=CPU", "-fa", "on"],
+  "common_env": {
+    "GGML_NUMA_FAKE": "2",
+    "GGML_NUMA_XGMI_GBPS": "60"
+  },
+  "variants": [
+    {
+      "name": "A-no-numa",
+      "args": [],
+      "env": {}
+    },
+    {
+      "name": "B-mirror",
+      "args": ["--numa", "mirror", "--numa-gpu-node", "1"],
+      "env": {}
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "name": "hybrid-spincount",
+  "binary": "/build/cuda/bin/llama-cli",
+  "model": "/models/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf",
+  "prompt_file": "/src/scripts/testbed/prompts/pp-long.txt",
+  "n_predict": 64,
+  "threads": 8,
+  "reps": 3,
+  "warmup": 1,
+  "common_args": ["-c", "4096", "--no-display-prompt",
+                  "-ngl", "99", "-ot", "exps=CPU", "-fa", "on"],
+  "common_env": {
+    "GGML_NUMA_FAKE": "2",
+    "GGML_NUMA_XGMI_GBPS": "60"
+  },
+  "variants": [
+    {
+      "name": "A-no-numa",
+      "args": [],
+      "env": {}
+    },
+    {
+      "name": "B-mirror-autopassive",
+      "args": ["--numa", "mirror", "--numa-gpu-node", "1"],
+      "env": {}
+    },
+    {
+      "name": "E-mirror-spin25k",
+      "args": ["--numa", "mirror", "--numa-gpu-node", "1"],
+      "env": { "GOMP_SPINCOUNT": "25000" }
+    },
+    {
+      "name": "F-mirror-spin250k",
+      "args": ["--numa", "mirror", "--numa-gpu-node", "1"],
+      "env": { "GOMP_SPINCOUNT": "250000" }
+    }
+  ]
+}

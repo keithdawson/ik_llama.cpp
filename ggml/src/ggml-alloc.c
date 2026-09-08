@@ -934,6 +934,27 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     return ggml_backend_buffer_get_size(galloc->buffers[buffer_id]);
 }
 
+int ggml_gallocr_get_n_buffers(ggml_gallocr_t galloc) {
+    return galloc->n_buffers;
+}
+
+ggml_backend_buffer_t ggml_gallocr_get_buffer(ggml_gallocr_t galloc, int buffer_id) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+
+    if (galloc->buffers[buffer_id] == NULL) {
+        return NULL;
+    }
+
+    for (int i = 0; i < buffer_id; i++) {
+        if (galloc->buffers[i] == galloc->buffers[buffer_id]) {
+            // shared with a previous slot; report it only once
+            return NULL;
+        }
+    }
+
+    return galloc->buffers[buffer_id];
+}
+
 // utils
 
 static bool alloc_tensor_range(struct ggml_context * ctx,

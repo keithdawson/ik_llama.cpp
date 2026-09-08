@@ -1,0 +1,38 @@
+{
+  "name": "hybrid-reserve-driver-cores",
+  "binary": "/build/cuda/bin/llama-cli",
+  "model": "/models/gemma-4-26B-A4B-it-UD-IQ4_XS.gguf",
+  "prompt_file": "/src/scripts/testbed/prompts/pp-long.txt",
+  "n_predict": 64,
+  "threads": 8,
+  "reps": 3,
+  "warmup": 1,
+  "common_args": ["-c", "4096", "--no-display-prompt",
+                  "-ngl", "99", "-ot", "exps=CPU", "-fa", "on"],
+  "common_env": {
+    "GGML_NUMA_FAKE": "2",
+    "GGML_NUMA_XGMI_GBPS": "60"
+  },
+  "variants": [
+    {
+      "name": "A-no-numa-t8",
+      "args": [],
+      "env": {}
+    },
+    {
+      "name": "B-mirror-t8-autopassive",
+      "args": ["--numa", "mirror", "--numa-gpu-node", "1"],
+      "env": {}
+    },
+    {
+      "name": "C-mirror-t7-reserve1",
+      "args": ["--numa", "mirror", "--numa-gpu-node", "1", "-t", "7"],
+      "env": { "GGML_NUMA_RESERVE_CPUS": "1" }
+    },
+    {
+      "name": "D-mirror-t6-reserve2",
+      "args": ["--numa", "mirror", "--numa-gpu-node", "1", "-t", "6"],
+      "env": { "GGML_NUMA_RESERVE_CPUS": "2" }
+    }
+  ]
+}
