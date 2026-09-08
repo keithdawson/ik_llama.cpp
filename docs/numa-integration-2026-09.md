@@ -20,6 +20,8 @@ Dense Qwen2.5-0.5B smoke gate passed: mirrored and baseline generation identical
 
 Qwen1.5-MoE-A2.7B IQ4_XS smoke gate passed: whole experts assigned to both nodes, shared experts mirrored, baseline/sharded/rebalanced generation identical. Rebalancing moved 804 experts at cost 1.0 and 162 at cost 2.0.
 
+Unfused MoE checks (`-no-fmoe` and `-no-fug`) passed with expert placement active and baseline/sharded output identical. CPU exclusions `0,2` passed with asymmetric fake-node output identical. One concurrent-build run lacked enough free RAM for mirroring; the placement assertion caught the fallback, and the test passed after compilation ended.
+
 GGUF imports and distinct GLM/openPangu indexer names passed.
 
 18 of 20 selected CTest tests passed. BERT tokenization and the ChatGLM4 chat-template expectation also fail on a separately compiled, unmodified upstream fe215a8 checkout. Initial Windows line-ending fixture failures were resolved by restoring repository LF endings.
