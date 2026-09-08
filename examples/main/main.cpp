@@ -712,7 +712,12 @@ int main(int argc, char ** argv) {
                 // if we run out of context:
                 // - take the n_keep first tokens from the original prompt (via n_past)
                 // - take half of the last (n_ctx - n_keep) tokens and recompute the logits in batches
-                if (n_past + (int) embd.size() + std::max<int>(0, guidance_offset) >= n_ctx) {
+                const bool context_full = n_past + (int) embd.size() + std::max<int>(0, guidance_offset) >= n_ctx;
+                if (context_full && !params.ctx_shift) {
+                    LOG_TEE("\n\n%s: context full and context shifting is disabled, stopping\n", __func__);
+                    break;
+                }
+                if (context_full) {
                     if (params.n_predict == -2) {
                         LOG_TEE("\n\n%s: context full and n_predict == -%d => stopping\n", __func__, params.n_predict);
                         break;
@@ -724,7 +729,7 @@ int main(int argc, char ** argv) {
                     LOG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
                             n_past, n_left, n_ctx, params.n_keep, n_discard);
 
-                    llama_kv_cache_seq_rm (ctx, 0, params.n_keep            , params.n_keep + n_discard);
+                    llama_kv_cache_seq_rm (ctx, 0, params.n_keep , params.n_keep + n_discard);
                     llama_kv_cache_seq_add(ctx, 0, params.n_keep + n_discard, n_past, -n_discard);
                     if (spec != nullptr) {
                         common_speculative_context_shift(spec, 0, params.n_keep, n_discard, n_past);
@@ -845,8 +850,7 @@ int main(int argc, char ** argv) {
                 const bool need_prompt_target_features =
                     embd_is_prompt &&
                     spec != nullptr &&
-                    (params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) ||
-                     params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH));
+                    params.speculative.uses_target_features();
 
                 llama_batch batch = {};
                 if (need_prompt_target_features) {
@@ -969,9 +973,11 @@ int main(int argc, char ** argv) {
                     draft_history,
                     sampled_before,
                     n_past,
-                    0);
+                    0,
+                    &sparams);
 
                 auto & draft = draft_result.tokens;
+                auto & proposal_dists = draft_result.proposal_dists;
                 int max_usable_draft = (int) draft.size();
                 if (n_predict_budget >= 0 && n_predict_budget != std::numeric_limits<int>::max()) {
                     max_usable_draft = std::min(max_usable_draft, std::max(0, n_predict_budget - 2));
@@ -980,11 +986,14 @@ int main(int argc, char ** argv) {
                 max_usable_draft = std::min(max_usable_draft, std::max(0, (int) llama_n_batch(ctx) - 1));
                 if ((int) draft.size() > max_usable_draft) {
                     draft.resize(max_usable_draft);
+                    if (!proposal_dists.empty()) {
+                        proposal_dists.resize(max_usable_draft);
+                    }
                 }
 
                 const int min_usable_draft = params.speculative.get_min_usable_stage_n_min();
                 if ((int) draft.size() >= min_usable_draft && (!draft.empty() || n_predict_budget > 1)) {
-                    if (llama_model_has_recurrent(model) || llama_model_is_openpangu(model)) {
+                    if (common_speculative_needs_checkpoint(model)) {
                         if (!common_speculative_before_draft(
                             spec,
                             model,
@@ -995,7 +1004,7 @@ int main(int argc, char ** argv) {
                             n_past,
                             sampled_before,
                             (int) draft.size() + 1,
-                            params.speculative.recurrent_ckpt_mode)) {
+                            params.speculative.spec_ckpt_mode)) {
                             LOG_TEE("%s: speculative checkpoint setup failed, falling back to one-token decode\n", __func__);
                             draft.clear();
                         }
@@ -1018,22 +1027,22 @@ int main(int argc, char ** argv) {
                             LOG_TEE("%s : failed to eval speculative batch\n", __func__);
                             return 1;
                         }
-
                         std::vector<llama_token> ids;
                         try {
-                            ids = common_sampler_sample_and_accept_n(ctx_sampling, ctx, verify_indices, draft);
+                            ids = proposal_dists.empty()
+                                ? common_sampler_sample_and_accept_n(ctx_sampling, ctx, verify_indices, draft)
+                                : common_sampler_sample_and_accept_n(ctx_sampling, ctx, verify_indices, draft, proposal_dists);
                         } catch (const std::exception & e) {
                             llama_batch_free(verify_batch);
                             LOG_TEE("%s: speculative sampling failed: %s\n", __func__, e.what());
                             return 1;
                         }
-
                         std::vector<int32_t> accepted_output_indices;
                         if (!ids.empty()) {
                             accepted_output_indices.assign(verify_indices.begin(), verify_indices.begin() + ids.size());
                         }
 
-                        common_speculative_commit(
+                        if (!common_speculative_commit(
                             spec,
                             ctx,
                             ctx_sampling,
@@ -1042,8 +1051,11 @@ int main(int argc, char ** argv) {
                             ids,
                             (int) draft.size(),
                             n_past + 1,
-                            accepted_output_indices);
-
+                            accepted_output_indices)) {
+                            llama_batch_free(verify_batch);
+                            LOG_TEE("%s: speculative checkpoint restore/commit failed\n", __func__);
+                            return 1;
+                        }
                         llama_batch_free(verify_batch);
 
                         if (!ids.empty()) {

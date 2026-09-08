@@ -36,10 +36,6 @@ static void openpangu_register_cache_copy(
     copies[idx].step = step;
 }
 
-static uint32_t openpangu_kv_cache_pad(const llama_cparams & cparams) {
-    return cparams.flash_attn ? 256u : 32u;
-}
-
 static bool openpangu_idx_score_should_chunk(int64_t n_tokens, int64_t chunk) {
     return chunk > 0 && n_tokens > 14 && n_tokens > chunk;
 }
@@ -122,35 +118,6 @@ static ggml_tensor * openpangu_cast_gathered_latent_for_cache_type(ggml_context 
     return !ggml_is_quantized(kl->type) && src->type != kl->type ? ggml_cast(ctx, src, kl->type) : src;
 }
 
-static ggml_tensor * openpangu_build_swa_mask_for_graph(llm_build_context & llm, uint32_t window, bool * windowed) {
-    *windowed = false;
-    llm.lctx.openpangu_swa_window_view = {};
-
-    if (window == 0) {
-        return nullptr;
-    }
-
-    const uint32_t pad = openpangu_kv_cache_pad(llm.cparams);
-    const llama_openpangu_swa_window_view view =
-        llama_openpangu_calc_swa_window_view(llm.n_kv, llm.n_tokens, window, pad);
-
-    if (!view.engaged) {
-        return llm.build_inp_KQ_mask_swa();
-    }
-
-    llm.lctx.openpangu_swa_window_view = {
-        true,
-        llm.n_kv,
-        llm.n_tokens,
-        window,
-        pad,
-        view.w_view,
-        view.win_off,
-    };
-    *windowed = true;
-    return llm.build_inp_KQ_mask_swa_win(view.w_view);
-}
-
 // openPangu-2.0-Flash graph.
 //
 // Attention runs absorbed MLA over a latent KV cache: per position the cache stores only
@@ -185,7 +152,7 @@ static ggml_tensor * openpangu_build_swa_mask_for_graph(llm_build_context & llm,
 // this site's two taps packed at float offset 2*site_off. The buffer is zeroed at cache
 // allocation and reset at pos 0, preserving zero history at sequence start (pos-0 graphs
 // are discarded from reuse via reset_previous, so the baked reset never runs at pos > 0).
-// Speculative rollback snapshots/restores the whole slot via the spec checkpoint.
+// Speculative rollback restores the whole slot: GPU mode snapshots it, CPU mode uses the partial layout.
 static ggml_tensor * openpangu_causal_conv(ggml_context * ctx, ggml_cgraph * gf,
                                            ggml_tensor * x, ggml_tensor * w,
                                            ggml_tensor * state_all, int64_t site_off,
@@ -337,8 +304,9 @@ ggml_tensor * llm_build_context::build_openpangu_attention(
             kpe_store = openpangu_cast_for_latent_cache_write(ctx0, kpe_store, kl);
         }
         ggml_tensor * k_latent = ggml_concat(ctx0, ckv_store, kpe_store, 0);
+        const int64_t store_row = kv_self.is_compacted(il) ? swa_head : kv_head;
         ggml_tensor * kl_full = ggml_view_2d(ctx0, kl, kv_lora_rank + n_embd_head_qk_rope,
-                                             n_tokens, kl->nb[1], kv_head*kl->nb[1]);
+                                             n_tokens, kl->nb[1], store_row*kl->nb[1]);
         ggml_tensor * cpy_kl = ggml_cpy(ctx0, k_latent, kl_full);
         openpangu_register_cache_copy(lctx, il, OPENPANGU_COPY_K_CKV, cpy_kl, kl->nb[1]);
         ggml_build_forward_expand(gf, cpy_kl);
@@ -366,7 +334,7 @@ ggml_tensor * llm_build_context::build_openpangu_attention(
         GGML_ASSERT(topk > 0 && topk <= INT_MAX);
         dsa_topk = topk;
 
-        const uint32_t pad = openpangu_kv_cache_pad(cparams);
+        const uint32_t pad = llama_kv_cache::get_padding(cparams.flash_attn);
         const bool is_base_graph = cparams.mtp_op_type == MTP_OP_NONE;
         const bool dsa_gather_predicate =
             openpangu_dsa_gather_should_engage(n_kv, n_tokens, topk, pad);
@@ -527,11 +495,11 @@ ggml_tensor * llm_build_context::build_openpangu_attention(
     // ---- latent attention over [sinks ++ cached tokens] (flash_attn is forced off) ----
     // Keep sinks and cached tokens separate until after KQ so f16 latent caches do not need
     // unsupported non-f32 concat along dim1.
-    const bool use_swa_window = KQ_mask_swa_windowed && lctx.openpangu_swa_window_view.active;
+    const bool use_swa_window = KQ_mask_swa_windowed && lctx.swa_window_view.active;
     const bool use_dsa_gather = dsa_gather_engaged && sel_idx != nullptr;
     const int64_t n_kv_attn   = use_dsa_gather ? dsa_topk :
-                                use_swa_window ? lctx.openpangu_swa_window_view.w_view  : n_kv;
-    const int64_t win_off     = use_swa_window ? lctx.openpangu_swa_window_view.win_off : 0;
+                                use_swa_window ? lctx.swa_window_view.w_view  : n_kv;
+    const int64_t win_off     = use_swa_window ? lctx.swa_window_view.win_off : 0;
     if (sel_mask) {
         GGML_ASSERT(!use_swa_window && "openPangu DSA/indexer layers must not use SWA window views");
     }
@@ -694,7 +662,7 @@ ggml_tensor * llm_build_context::build_openpangu_attention(
                 const bool prefill_gather_chunk =
                     can_prefill_gather &&
                     openpangu_dsa_prefill_gather_should_engage(n_kv, n_tokens, c0, tc, dsa_topk,
-                                                               openpangu_kv_cache_pad(cparams));
+                                                               llama_kv_cache::get_padding(cparams.flash_attn));
                 ggml_tensor * kqv_c = nullptr;
                 if (prefill_gather_chunk) {
                     if (use_fused_attn) {
@@ -922,12 +890,7 @@ ggml_tensor * llm_build_context::build_openpangu_mtp(
     ggml_tensor * token_emb = ggml_get_rows(ctx0, mtp_embd_weights, inp_tokens);
     cb(token_emb, "inp_embd", il);
 
-    ggml_tensor * emb_norm = llm_build_norm(ctx0, token_emb,       hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il);
-    ggml_tensor * hid_norm = llm_build_norm(ctx0, prev_embeddings, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il);
-
-    // reference order: cat([inputs_embeds, previous_hidden_states], -1)
-    ggml_tensor * combined = ggml_concat(ctx0, emb_norm, hid_norm, 0);
-    ggml_tensor * cur = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
+    ggml_tensor * cur = build_mtp_input(mtp_layer, prev_embeddings, token_emb, il, nullptr);
     cb(cur, "mtp_eh_proj", il);
 
     // --- attention sublayer (plain residual) ---
@@ -1002,6 +965,13 @@ ggml_cgraph * llm_build_context::build_openpangu() {
     if (batch.pos && batch.n_tokens > 0) {
         GGML_ASSERT((llama_pos) kv_head == batch.pos[0] &&
                     "openPangu KV cache is position-addressed; kv head must equal the first batch position");
+        if (kv_self.any_compacted()) {
+            GGML_ASSERT(swa_head >= (int32_t) kv_self.sink_rows &&
+                        swa_head + n_tokens <= (int32_t) kv_self.size_swa &&
+                        "compacted store must fit inside the window region");
+            GGML_ASSERT(kv_self.pos_base_swa + (llama_pos) (swa_head - (int32_t) kv_self.sink_rows) == batch.pos[0] &&
+                        "compacted row<->position map must agree with the batch position");
+        }
     }
 
     const int64_t n_embd_head_k = hparams.n_embd_head_k(0);                // 192
@@ -1022,15 +992,7 @@ ggml_cgraph * llm_build_context::build_openpangu() {
                     "OpenPangu MTP graph requested without NextN layers loaded");
         GGML_ASSERT(batch.token && "openPangu MTP graphs decode token batches");
 
-        ggml_tensor * hidden_states_from_main_model;
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
-        }
-        ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
-        ggml_set_input(hidden_states_from_main_model);
-        lctx.inp_mtp_states = hidden_states_from_main_model;
+        ggml_tensor * hidden_states_from_main_model = build_inp_mtp_states(hparams.n_embd);
 
         // shared batch inputs, created exactly once per graph (see build_openpangu_mtp)
         ggml_tensor * inp_pos = build_inp_pos();
@@ -1038,7 +1000,7 @@ ggml_cgraph * llm_build_context::build_openpangu() {
         // uses hparams.n_swa_mtp when the graph is built with an MTP op type
         bool KQ_mask_swa_windowed = false;
         ggml_tensor * KQ_mask = hparams.n_swa_mtp > 0 && hparams.n_swa > 0
-            ? openpangu_build_swa_mask_for_graph(*this, hparams.n_swa_mtp, &KQ_mask_swa_windowed)
+            ? build_swa_mask_for_graph(hparams.n_swa_mtp, /* compacted = */ false, &KQ_mask_swa_windowed)
             : build_inp_KQ_mask();
         ggml_tensor * inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
         lctx.inp_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch.n_tokens);
@@ -1177,7 +1139,9 @@ ggml_cgraph * llm_build_context::build_openpangu() {
     // mask and add the indexer's top-k selection inside the attention builder. Absent
     // schedule keys (n_swa == 0) keep every layer dense (pre-DSA GGUF fallback).
     bool KQ_mask_swa_windowed = false;
-    ggml_tensor * KQ_mask_swa = hparams.n_swa > 0 ? openpangu_build_swa_mask_for_graph(*this, hparams.n_swa, &KQ_mask_swa_windowed) : nullptr;
+    ggml_tensor * KQ_mask_swa = hparams.n_swa > 0
+        ? build_swa_mask_for_graph(hparams.n_swa, kv_self.any_compacted(), &KQ_mask_swa_windowed)
+        : nullptr;
     lctx.inp_s_seq_qnext = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 1, n_tokens);
     cb(lctx.inp_s_seq_qnext, "inp_s_seq_qnext", -1);
     ggml_set_input(lctx.inp_s_seq_qnext);
@@ -1195,69 +1159,27 @@ ggml_cgraph * llm_build_context::build_openpangu() {
         if (!ggml_is_contiguous(Rin)) {
             Rin = ggml_cont(ctx0, Rin);
         }
-        ggml_tensor * flat = ggml_reshape_2d(ctx0, Rin, n_embd * S, n_tokens);
-        ggml_tensor * normed = ggml_fused_rms_norm(ctx0, flat, gamma, hparams.f_norm_rms_eps);
-        ggml_tensor * mixes = ggml_mul_mat(ctx0, phi, normed);        // [(S+2)*S, T]
-        ggml_tensor * h_pre  = ggml_view_2d(ctx0, mixes, S, n_tokens, mixes->nb[1], 0);
-        ggml_tensor * h_post = ggml_view_2d(ctx0, mixes, S, n_tokens, mixes->nb[1], S*ggml_element_size(mixes));
-        ggml_tensor * h_res  = ggml_view_2d(ctx0, mixes, S*S, n_tokens, mixes->nb[1], 2*S*ggml_element_size(mixes));
-
-        // alpha = [a_pre, a_post, a_res]; beta = [b_pre(S), b_post(S), b_res(S*S)]
-        ggml_tensor * a_pre  = ggml_view_1d(ctx0, alpha, 1, 0);
-        ggml_tensor * b_pre  = ggml_view_1d(ctx0, beta, S, 0);
-        // cont is required: the CUDA broadcast-mul path misreads strided views (h_pre is a
-        // row-slice of mixes), while CPU handles the strides — token 0 right, tokens 1+ garbage
-        h_pre = ggml_add(ctx0, ggml_mul(ctx0, ggml_cont(ctx0, h_pre), a_pre), b_pre);  // broadcast scalar + [S]
-        h_pre = ggml_sigmoid(ctx0, h_pre);                            // [S,T] (+eps omitted, inert)
+        ggml_tensor * mixes = build_mhc_pre_projection(
+                Rin, phi, gamma, n_embd, S, hparams.f_norm_rms_eps, true); // [(S+2)*S, T]
+        ggml_tensor * all = ggml_hc_pre(ctx0, mixes, alpha, beta, (int) S, sink_iters, 0.0f);
+        ggml_tensor * h_pre  = ggml_view_2d(ctx0, all, S, n_tokens, S*sizeof(float), 0);
+        ggml_tensor * h_post = ggml_view_2d(ctx0, all, S, n_tokens, S*sizeof(float), S*n_tokens*sizeof(float));
+        ggml_tensor * h_res  = ggml_view_3d(ctx0, all, S, S, n_tokens,
+                S*sizeof(float), S*S*sizeof(float), 2*S*n_tokens*sizeof(float));
 
         //// combine: x[h,t] = sum_s h_pre[s,t] * R[h,s,t]
-        ggml_tensor * hpre3 = ggml_reshape_3d(ctx0, h_pre, 1, S, n_tokens);
-        auto x = ggml_mul_multi_add(ctx0, Rin, hpre3);
-        //ggml_tensor * weighted = ggml_mul(ctx0, Rin, hpre3);          // [H,S,T]
-        //ggml_tensor * x = ggml_reshape_2d(ctx0, ggml_sum_rows_ext(ctx0, weighted, 1), n_embd, n_tokens);
+        auto x = build_mhc_weighted_sum(Rin, h_pre, n_embd, S);
         ggml_build_forward_expand(gf, x);
 
-        *h_post_out = ggml_cont(ctx0, h_post);
-        *h_res_out  = ggml_cont(ctx0, h_res);
+        *h_post_out = h_post;
+        *h_res_out  = h_res;
         return x;
     };
 
-    ggml_tensor repeater;
-    repeater.ne[0] = n_embd; repeater.ne[1] = S; repeater.ne[2] = n_tokens; repeater.ne[3] = 1;
-
-    // mHC post: R_new[h,s,t] = h_post[s,t]*y[h,t] + sum_j m[s,j,t]*R[h,j,t]
+    // mHC post: R_new[h,s,t] = h_post[s,t]*y[h,t] + sum_j h_res[s,j,t]*R[h,j,t]
     auto mhc_post = [&](ggml_tensor * y, ggml_tensor * h_post, ggml_tensor * Rin,
-                        ggml_tensor * alpha, ggml_tensor * beta, ggml_tensor * h_res) {
-        ggml_tensor * a_post = ggml_view_1d(ctx0, alpha, 1, 1*ggml_element_size(alpha));
-        ggml_tensor * a_res  = ggml_view_1d(ctx0, alpha, 1, 2*ggml_element_size(alpha));
-        ggml_tensor * b_post = ggml_view_1d(ctx0, beta, S,   S*ggml_element_size(beta));
-        ggml_tensor * b_res  = ggml_view_1d(ctx0, beta, S*S, 2*S*ggml_element_size(beta));
-
-        h_post = ggml_add(ctx0, ggml_mul(ctx0, h_post, a_post), b_post);
-        h_post = ggml_scale(ctx0, ggml_sigmoid(ctx0, h_post), 2.0f);  // 2*sigmoid, [S,T]
-
-        ggml_tensor * m = ggml_add(ctx0, ggml_mul(ctx0, h_res, a_res), b_res); // [S*S,T]
-        m = ggml_sinkhorn(ctx0, m, (int) S, sink_iters, 0.0f, /*output_transposed=*/true); // [row S, col S, T]
-
-        // term1: h_post[s,t]*y[h,t] -> [H,S,T]
-        ggml_tensor * y3 = ggml_reshape_3d(ctx0, y, n_embd, 1, n_tokens);
-        ggml_tensor * hpost3 = ggml_reshape_3d(ctx0, ggml_cont(ctx0, h_post), 1, S, n_tokens);
-        ggml_tensor * term1 = ggml_mul(ctx0, ggml_repeat(ctx0, y3, &repeater), hpost3);
-
-        // term2: sum_j m[s,j,t]*R[h,j,t]. For each out-stream s, weight over input streams j.
-        // Build via: for stream axis, matmul R[H, j, t] with m[j, s, t] batched over t.
-        // R_perm [j(S), H, T] ; m as [j(S), s(S), T]; batched mul_mat over T -> [H? ] messy.
-        // Simpler explicit loop over S output streams (S=4, cheap):
-        ggml_tensor * term2 = nullptr;
-        for (int64_t s = 0; s < S; ++s) {
-            // m_s = m[:, s, :] -> weights over input streams j: [S, T]
-            ggml_tensor * m_s = ggml_cont(ctx0, ggml_view_2d(ctx0, m, S, n_tokens, m->nb[2], s*m->nb[1]));
-            ggml_tensor * m_s3 = ggml_reshape_3d(ctx0, m_s, 1, S, n_tokens);      // [1,S,T]
-            ggml_tensor * acc = ggml_mul(ctx0, Rin, m_s3);                        // [H,S,T]
-            ggml_tensor * summed = ggml_sum_rows_ext(ctx0, acc, 1);               // [H,1,T]
-            term2 = term2 ? ggml_concat(ctx0, term2, summed, 1) : summed;         // -> [H,S,T]
-        }
-        return ggml_add(ctx0, term1, term2); // [H,S,T]
+                        ggml_tensor * h_res) {
+        return build_mhc_post(y, h_post, Rin, h_res, n_embd, S, true);
     };
 
     // Base generation uses only the transformer layers; the trailing NextN/MTP layers are skipped.
@@ -1274,7 +1196,7 @@ ggml_cgraph * llm_build_context::build_openpangu() {
         cur = llm_build_norm(ctx0, x, hparams, layer.attn_norm, NULL, LLM_NORM_RMS, cb, il);
         if (il == 0) ggml_set_name(cur, "opg0_attn_norm");
 
-        const bool layer_swa = KQ_mask_swa && hparams.openpangu_window[il] > 0;
+        const bool layer_swa = KQ_mask_swa && hparams.swa_layers[il];
         ggml_tensor * layer_mask = layer_swa ? KQ_mask_swa : KQ_mask;
         cur = build_openpangu_attention(gf, layer, il, cur, layer_mask, inp_pos,
                                         conv_state, seq_qnext, kq_scale,
@@ -1285,7 +1207,7 @@ ggml_cgraph * llm_build_context::build_openpangu() {
         if (il == 0) ggml_set_name(cur, "opg0_attn_postnorm");
 
         // mHC post -> scatter back to S streams
-        R = mhc_post(cur, h_post_a, R, layer.mhc_attn_alpha, layer.mhc_attn_beta, h_res_a);
+        R = mhc_post(cur, h_post_a, R, h_res_a);
         if (il == 0) ggml_set_name(R, "opg0_R_attn");
 
         // ================= ffn sublayer =================
@@ -1312,7 +1234,7 @@ ggml_cgraph * llm_build_context::build_openpangu() {
         cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_post_norm, NULL, LLM_NORM_RMS, cb, il);
         if (il == 0) ggml_set_name(cur, "opg0_ffn_postnorm");
 
-        R = mhc_post(cur, h_post_m, R, layer.mhc_mlp_alpha, layer.mhc_mlp_beta, h_res_m);
+        R = mhc_post(cur, h_post_m, R, h_res_m);
 
         // block post-norm on the layer subset (RMSNorm over the concatenated S*H)
         if (layer.block_post_norm) {

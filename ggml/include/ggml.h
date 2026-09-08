@@ -868,6 +868,7 @@ extern "C" {
 
     // computation graph
     struct ggml_cgraph {
+        uint64_t uid;
         int size;
         int n_nodes;
         int n_leafs;
@@ -2012,6 +2013,13 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * c);
 
+    GGML_API struct ggml_tensor * ggml_get_rows_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            bool                  same_type,
+            bool                  dim0);
+
     // a TD  [n_embd, ne1,    ne2,    ne3]
     // b TS  [n_embd, n_rows, ne02,   ne03] | ne02 == ne2, ne03 == ne3
     // c I64 [n_rows, ne11,   ne12,   1]    | c[i] in [0, ne1)
@@ -2541,7 +2549,11 @@ extern "C" {
             int                   nk,
             int                   topk_experts);
 
+#if GGML_USE_VULKAN
+#define GGML_KQ_MASK_PAD 64
+#else
 #define GGML_KQ_MASK_PAD 16
+#endif
 
     // q:    [n_embd, n_batch,     n_head,    1]
     // k:    [n_embd, n_kv,        n_head_kv, 1]
@@ -3406,6 +3418,9 @@ extern "C" {
             struct ggml_context         * ctx,
             struct ggml_tensor          * dst,
             struct ggml_tensor          * src);
+
+    GGML_API void  ggml_set_quantize_fudge_factor(enum ggml_type type, float fudge);
+    GGML_API float ggml_get_quantize_fudge_factor(enum ggml_type type);
 
 #ifdef  __cplusplus
 }

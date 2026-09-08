@@ -169,6 +169,9 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
     int n_device = model.splits.size();
     GGML_ASSERT(n_device > 1);
     GGML_ASSERT(cparams.flash_attn);
+    // llama_kv_cache_init() refuses --swa-compress with a split/replicated cache, so this
+    // builder never sees a compacted cache and does not handle the compacted layout.
+    GGML_ASSERT(!kv_self.any_compacted());
     ggml_cgraph * gf = llm.new_graph_custom();
 
     bool is_moe = hparams.n_expert > 0;
@@ -215,6 +218,7 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
 
         int nhave = 0;
         ggml_tensor * sa_last = nullptr;
+        bool emitted_prev_l_out = false;
         for (int id = 0; id < n_device; ++id) {
             GGML_ASSERT((wq->splits[id] && wk->splits[id] && (!wv || wv->splits[id]) && wo->splits[id]) ||
                     (!wq->splits[id] && !wk->splits[id] && (!wv || !wv->splits[id]) && !wo->splits[id]));
@@ -256,6 +260,10 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
                     auto scale = (const ggml_split_tensor_t *)model.layers[il-1].out_scale->extra;
                     sa_inp[id] = ggml_mul(ctx0, sa_inp[id], scale->splits[id]);
                     cb(sa_inp[id], "sa_inp_scaled", il_cb);
+                }
+                if (!emitted_prev_l_out) {
+                    cb(sa_inp[id], "l_out", il - 1);
+                    emitted_prev_l_out = true;
                 }
             }
             auto cur = llm_build_context::do_split_norm(ctx0, sa_inp[id], model.layers[il].attn_norm, hparams, cb, id, il_cb, false);
@@ -517,6 +525,7 @@ static ggml_cgraph * build_gemma4_graph_parallel(llm_build_context & llm, llama_
         cur = ggml_mul(ctx0, cur, scale->splits[idx]);
         cb(cur, "ffn_out_scaled", hparams.n_layer-1);
     }
+    cb(cur, "l_out", hparams.n_layer-1);
 
     cur = llm_build_context::build_output(lctx, ctx0, cur, model.output, model.output_norm, cb);
     if (hparams.f_final_logit_softcapping > 0) {
@@ -541,19 +550,12 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
 
     GGML_ASSERT(n_backbone > 0);
 
-    ggml_tensor * hidden_state = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_backbone, n_tokens);
-    ggml_set_name(hidden_state, "inp_mtp_states");
-    ggml_set_input(hidden_state);
-    lctx.inp_mtp_states = hidden_state;
+    ggml_tensor * hidden_state = build_inp_mtp_states(n_backbone);
 
     if (!has_target_ctx || !batch.token) {
         ggml_tensor * cur = ggml_view_2d(ctx0, hidden_state, n_embd, n_tokens,
                 ggml_row_size(hidden_state->type, n_backbone), 0);
         cb(cur, "mtp_init_hidden_view", -1);
-
-        ggml_tensor * mtp_embd = ggml_dup(ctx0, hidden_state);
-        cb(mtp_embd, "result_mtp_embd", -1);
-        ggml_build_forward_expand(gf, mtp_embd);
 
         ggml_tensor * logits = build_output(lctx, ctx0, cur, model.output, model.output_norm, cb);
         cb(logits, "result_output", -1);
@@ -573,6 +575,10 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
     const llama_kv_cache & target_kv     = lctx.mtp_target_ctx->kv_self;
 
     GGML_ASSERT(n_tokens <= target_kv.n);
+    // llama_new_context_with_model() refuses MTP together with --swa-compress for every arch
+    // except deepseek4, so the target cache here is never compacted and this builder addresses
+    // it by absolute cell index (target_kv.head / target_kv.n) throughout.
+    GGML_ASSERT(!target_kv.any_compacted());
 
     ggml_tensor * inp_pos = build_inp_pos();
 
@@ -679,7 +685,7 @@ ggml_cgraph * llm_build_context::build_gemma4_mtp() {
                 GGML_ASSERT(model.layers[il].attn_q_norm && model.layers[il].attn_q_norm->extra);
                 Qcur = do_split_norm(ctx0, Qcur, model.layers[il].attn_q_norm, hparams, cb, id, il_cb, false);
                 cb(Qcur, "Qcur_normed", il_cb);
-                auto freq_factors = is_sliding ? nullptr : ((const ggml_split_tensor_t *)model.layers[il].rope_freqs->extra)->splits[id];
+                auto freq_factors = is_sliding || !model.layers[il].rope_freqs ? nullptr : ((const ggml_split_tensor_t *)model.layers[il].rope_freqs->extra)->splits[id];
                 Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Qcur, "Qcur_rope", il_cb);
@@ -903,7 +909,7 @@ ggml_cgraph * llm_build_context::build_gemma4() {
     inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
     cb(inpL, "tok_embd", -1);
 
-    // important: do not normalize weights for raw embeddings input (i.e. encoded image emdeddings)
+    // important: do not normalize weights for raw embeddings input (i.e. encoded image embeddings)
     if (batch.token) {
         inpL = ggml_scale(ctx0, inpL, sqrtf(n_embd));
         cb(inpL, "inp_scaled", -1);
@@ -915,7 +921,11 @@ ggml_cgraph * llm_build_context::build_gemma4() {
     // KQ_mask (mask for 1 head, it will be broadcasted to all heads)
     // gemma3 requires different mask for layers using sliding window (SWA)
     struct ggml_tensor * KQ_mask     = build_inp_KQ_mask(true);
-    struct ggml_tensor * KQ_mask_swa = build_inp_KQ_mask_swa(true);
+    // With --swa-compress the sliding-window layers are allocated at window size, so their mask
+    // has to be built over the compacted layout rather than over n_ctx rows.
+    struct ggml_tensor * KQ_mask_swa = kv_self.any_compacted()
+        ? build_swa_mask_for_graph(hparams.n_swa, true)
+        : build_inp_KQ_mask_swa(true);
 
     auto inp_out_ids = n_tokens > 1 ? build_inp_out_ids() : nullptr;
 
@@ -1012,8 +1022,11 @@ ggml_cgraph * llm_build_context::build_gemma4() {
                         ext_factor, attn_factor, beta_fast, beta_slow);
                 cb(Kcur, "Kcur_rope", il);
             }
+            // swa_head is the store head for a compacted layer; build_std_attention passes it on the
+            // path above, so the shared-KV / no-wv path here has to pass it too.
             cur = llm_build_kv(ctx0, lctx, kv_self, gf, model.layers[il].wo, model.layers[il].bo,
-                Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv, hparams.f_attention_scale, cb, il, nullptr, n_swa);
+                Kcur, Vcur, Qcur, KQ_mask_l, n_tokens, kv_head, n_kv, hparams.f_attention_scale, cb, il, nullptr, n_swa,
+                -1, nullptr, nullptr, swa_head);
 
 
             if (il == n_layer - 1 && inp_out_ids) {
@@ -1125,12 +1138,6 @@ ggml_cgraph * llm_build_context::build_gemma4() {
     }
 
     cur = inpL;
-
-    if (cparams.mtp) {
-        ggml_tensor * mtp_embd = ggml_dup(ctx0, cur);
-        cb(mtp_embd, "result_mtp_embd", -1);
-        ggml_build_forward_expand(gf, mtp_embd);
-    }
 
     cur = llm_build_norm(ctx0, cur, hparams, model.output_norm, NULL, LLM_NORM_RMS, cb, -1);
     cb(cur, "result_norm", -1);

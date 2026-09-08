@@ -8,6 +8,8 @@
 #include "ggml-cuda.h"
 #include "ggml.h"
 #include "ggml-backend-impl.h"
+//#include "ggml-impl.h"
+#include "ggml-utils.h"
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -56,6 +58,7 @@
 #include "ggml-cuda/reduce.cuh"
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/delta-net.cuh"
+#include "ggml-cuda/kda.cuh"
 #include "ggml-cuda/sinkhorn.cuh"
 #include "ggml-cuda/latent_attn.cuh"
 #include "ggml-cuda/blend.cuh"
@@ -304,6 +307,7 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 /* ---------- hot-swap: invalidate all cached CUDA graphs ---------- */
 extern "C" void ggml_backend_cuda_invalidate_graphs(const void * model) {
+#ifdef USE_CUDA_GRAPH
     auto & info = const_cast<ggml_cuda_device_info &>(ggml_cuda_info());
     if (auto it = info.all_ctx.find(model); it != info.all_ctx.end()) {
         for (auto ctx : it->second) {
@@ -314,6 +318,9 @@ extern "C" void ggml_backend_cuda_invalidate_graphs(const void * model) {
     } else {
         fprintf(stderr, "================================= %s: did not find entry for model at %p\n", __func__, model);
     }
+#else
+    GGML_UNUSED(model);
+#endif // USE_CUDA_GRAPH
     //for (int i = 0; i < info.device_count; ++i) {
     //    if (info.all_ctx[i]) {
     //        info.all_ctx[i]->cuda_graphs.clear();
@@ -2040,7 +2047,7 @@ static void ggml_cuda_op_mul_mat(
 
         // If src0 is on a temporary compute buffer (partial offloading) there may be some padding that needs to be cleared:
         if (ne00 % MATRIX_ROW_PADDING != 0 && ggml_is_quantized(src0->type) && ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE && src0->view_src == nullptr) {
-            const int64_t nbytes_data    = ggml_row_size(src0->type, (dev[id].row_high - dev[id].row_low)*ne00);
+            const int64_t nbytes_data    = ggml_nbytes(src0);
             const int64_t nbytes_padding = ggml_row_size(src0->type, MATRIX_ROW_PADDING - ne00 % MATRIX_ROW_PADDING);
             CUDA_CHECK(cudaMemsetAsync(dev[id].src0_dd + nbytes_data , 0, nbytes_padding, stream));
         }
@@ -2516,7 +2523,7 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                 src0->type, stream);
         CUDA_CHECK(cudaGetLastError());
 
-        // The code below handles the case when Q, K, V have a bias applied after the resepctive matrix multiplication.
+        // The code below handles the case when Q, K, V have a bias applied after the respective matrix multiplication.
         // In that case the graph contains mul_mat(Q) -> mul_mat(K) -> mul_mat(V) -> add(Q) -> add(K) -> add(V)
         if (fusion && cgraph && node_n + 5 < cgraph->n_nodes &&
             cgraph->nodes[node_n+1]->op == GGML_OP_MUL_MAT &&
@@ -2570,7 +2577,8 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
                                || dst->op == GGML_OP_PERMUTE || dst->op == GGML_OP_NONE) {
             ++node_n; continue;
         }
-        if (dst->op != GGML_OP_MUL_MAT || dst->src[1] != src1 || !ggml_is_quantized(dst->src[0]->type)) break;
+        if (dst->op != GGML_OP_MUL_MAT || dst->src[1] != src1 || !ggml_is_quantized(dst->src[0]->type) ||
+                !ggml_cuda_should_use_mmq(dst->src[0]->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[1])) break;
         if (!is_gemv && mmq_get_q8_1_ds_layout(src0->type) != mmq_get_q8_1_ds_layout(dst->src[0]->type)) break;
         if (is_gemv) {
             if (fusion && node_n + 2 < cgraph->n_nodes &&
@@ -2639,14 +2647,50 @@ static void mul_mat_1row(const ggml_tensor * src0, const ggml_tensor * src1, ggm
     }
 }
 
+static __global__ void k_simple_gemm_f32(int n, int nx, const float * x, const float * y, float * z, size_t nb01, size_t nb11) {
+    int ix = blockIdx.x;
+    int iy = blockIdx.y;
+    x += nb01 * ix;
+    y += nb11 * iy;
+    float sum = 0;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        sum += x[j]*y[j];
+    }
+    sum = warp_reduce_sum(sum);
+    __shared__ float tmp[32];
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int warp_id = threadIdx.x / WARP_SIZE;
+    if (lane_id == 0) tmp[warp_id] = sum;
+    __syncthreads();
+    sum = tmp[lane_id];
+    sum = warp_reduce_sum(sum);
+    if (threadIdx.x == 0) {
+        z[iy*nx + ix] = sum;
+    }
+}
+
 static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n) {
+
+    if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src0->ne[0] >= 1024 && src0->ne[2]*src0->ne[3] == 1 && src1->ne[2]*src1->ne[3] == 1 && src1->ne[1] <= 8) {
+        auto nsm = ggml_cuda_info().devices[ctx.device].nsm;
+        if (src0->ne[1] * src1->ne[1] <= nsm) {
+            dim3 grid(src0->ne[1], src1->ne[1], 1);
+            k_simple_gemm_f32<<<grid, 1024, 0, ctx.stream()>>>(src0->ne[0], src0->ne[1], (const float *)src0->data, (const float *)src1->data, (float *)dst->data,
+                    src0->nb[1]/sizeof(float), src1->nb[1]/sizeof(float));
+            return node_n;
+        }
+    }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
-        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    const size_t src0_nbytes = ggml_nbytes(src0);
+    const size_t src0_alloc  = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+    const bool   src0_padded = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && src0_nbytes != src0_alloc;
+    const bool bad_padding_clear = src0_padded && src0->view_src;
 
     bool use_dequantize_mul_mat_vec = ggml_cuda_dmmv_type_supported(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
@@ -2670,6 +2714,10 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_available(cc);
 
     if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1) {
+        // This return does not go through ggml_cuda_op_mul_mat, which is where the padding is otherwise cleared.
+        if (src0_padded) {
+            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + src0_nbytes, 0, src0_alloc - src0_nbytes, ctx.stream()));
+        }
         return ggml_cuda_mul_mat_q(ctx, src0, src1, dst, cgraph, node_n, use_mul_mat_vec_q);
     }
 
@@ -3779,6 +3827,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_UNARY_OP_GELU_ERF:
                     ggml_cuda_op_gelu_erf(ctx, dst);
                     break;
+                case GGML_UNARY_OP_ABS:
+                    ggml_cuda_op_abs(ctx, dst);
+                    break;
+                case GGML_UNARY_OP_SGN:
+                    ggml_cuda_op_sgn(ctx, dst);
+                    break;
                 case GGML_UNARY_OP_SILU:
                     ggml_cuda_op_silu(ctx, dst);
                     break;
@@ -3924,13 +3978,53 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 i += 4;
             }
             else if (fusion && i + 2 < cgraph->n_nodes &&
-                cgraph->nodes[i+1]->op == GGML_OP_VIEW &&
+                (cgraph->nodes[i+1]->op == GGML_OP_VIEW || cgraph->nodes[i+1]->op == GGML_OP_RESHAPE) &&
                 cgraph->nodes[i+2]->op == GGML_OP_FUSED_RMS_NORM &&
                 dst->ne[2] == 1 && cgraph->nodes[i+2]->ne[2] == 1) {
                 ggml_cuda_op_fused_rms_rms_norm(ctx, dst, cgraph->nodes[i+2]);
                 i += 2;
-            } else {
-                ggml_cuda_op_fused_rms_norm(ctx, dst);
+            }
+            else {
+                int inow = i;
+                // First try rms -> add -> rms
+                // This doesn't always work because the second rms result may get allocated on top of the
+                // first rms source
+                if (fusion && i + 2 < cgraph->n_nodes &&
+                    cgraph->nodes[i+1]->op == GGML_OP_ADD &&
+                    cgraph->nodes[i+2]->op == GGML_OP_FUSED_RMS_NORM &&
+                    dst->src[0]->ne[1] == 1 &&
+                    dst->src[0]->type != GGML_TYPE_Q8_0 && // In case someone has decided to use Q8_0 as the graph reduce type
+                    cgraph->nodes[i+1]->src[0] == dst &&
+                    cgraph->nodes[i+2]->src[0] == cgraph->nodes[i+1] &&
+                    ggml_are_same_shape(dst, cgraph->nodes[i+1]->src[1])) {
+                    auto src0 = (const char *)dst->src[0]->data;
+                    auto src0_end = src0 + ggml_nbytes(dst->src[0]);
+                    auto add1 = (const char *)cgraph->nodes[i+1]->data;
+                    auto rms2 = (const char *)cgraph->nodes[i+2]->data;
+                    auto nbytes = ggml_nbytes(dst);
+                    bool overlap1 = add1 > src0 && add1 < src0_end;
+                    bool overlap2 = add1 + nbytes > src0 && add1 + nbytes < src0_end;
+                    bool overlap3 = add1 <= src0 && add1 + nbytes >= src0_end && !(add1 == src0 && add1 + nbytes == src0_end);
+                    bool overlap4 = rms2 > src0 && rms2 < src0_end;
+                    bool overlap5 = rms2 + nbytes > src0 && rms2 + nbytes < src0_end;
+                    bool overlap6 = rms2 <= src0 && rms2 + nbytes >= src0_end && !(rms2 == src0 && rms2 + nbytes == src0_end);
+                    if (!overlap1 && !overlap2 && !overlap3 && !overlap4 && !overlap5 && !overlap6) {
+                        ggml_cuda_op_fused_rms_add_rms(ctx, cgraph->nodes[i+2]);
+                        i += 2;
+                    }
+                }
+                // If that did not work, try rms -> add
+                if (fusion && inow == i && i + 1 < cgraph->n_nodes &&
+                    dst->src[0]->type != GGML_TYPE_Q8_0 && // In case someone has decided to use Q8_0 as the graph reduce type
+                    cgraph->nodes[i+1]->op == GGML_OP_ADD &&
+                    cgraph->nodes[i+1]->src[0] == dst &&
+                    ggml_are_same_shape(dst, cgraph->nodes[i+1]->src[1])) {
+                    ggml_cuda_op_fused_rms_add(ctx, cgraph->nodes[i+1]);
+                    i += 1;
+                }
+                if (inow == i) {
+                    ggml_cuda_op_fused_rms_norm(ctx, dst);
+                }
             }
             break;
         case GGML_OP_FUSED_RMS_RMS_ADD:
@@ -4130,9 +4224,24 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SOLVE_TRI:
             ggml_cuda_op_solve_tri(ctx, dst);
             break;
-        case GGML_OP_DELTA_NET:
-            ggml_cuda_op_delta_net(ctx, dst);
-            break;
+        case GGML_OP_DELTA_NET: {
+            const auto op_delta_net = dst->src[3]->ne[1] == 1 ? ggml_cuda_op_delta_net : ggml_cuda_op_kda;
+            const int j = fusion ? ggml_delta_net_find_state_cpy(cgraph, i) : -1;
+            if (j >= 0) {
+                ggml_tensor fused = *dst;
+                fused.src[7] = cgraph->nodes[j]->src[1];
+                op_delta_net(ctx, &fused);
+#ifdef USE_CUDA_GRAPH
+                // claim the entry of the copy that is not going to be launched
+                if (ctx.cur_graph && ctx.cur_graph->use_cpy_indirection) {
+                    ctx.cur_graph->graph_cpynode_index++;
+                }
+#endif
+                i = j;
+            } else {
+                op_delta_net(ctx, dst);
+            }
+        } break;
         case GGML_OP_SINKHORN:
             ggml_cuda_op_sinkhorn(ctx, dst);
             break;
@@ -4441,6 +4550,8 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
         graph->use_cpy_indirection = true;
         // copy pointers to GPU so they can be accessed via indirection within CUDA graph
         ggml_cuda_cpy_dest_ptrs_copy(graph, graph->cpy_dest_ptrs.data(), graph->cpy_dest_ptrs.size(), stream);
+    } else {
+        graph->use_cpy_indirection = false;
     }
 
     return use_cuda_graph;
@@ -4449,6 +4560,9 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
 static void set_ggml_graph_node_properties(ggml_tensor * node, ggml_graph_node_properties * graph_node_properties) {
     graph_node_properties->node_address = node->data;
     graph_node_properties->node_op = node->op;
+    graph_node_properties->type = node->type;
+    graph_node_properties->view_src = node->view_src;
+    graph_node_properties->view_offs = node->view_offs;
     for (int i = 0; i < GGML_MAX_DIMS; i++) {
         graph_node_properties->ne[i] = node->ne[i];
         graph_node_properties->nb[i] = node->nb[i];
@@ -4459,45 +4573,12 @@ static void set_ggml_graph_node_properties(ggml_tensor * node, ggml_graph_node_p
     memcpy(graph_node_properties->op_params, node->op_params, GGML_MAX_OP_PARAMS);
 }
 
-static bool ggml_graph_node_has_matching_properties(ggml_tensor * node, ggml_graph_node_properties * graph_node_properties) {
-    if (node->data != graph_node_properties->node_address &&
-          node->op != GGML_OP_CPY &&
-          node->op != GGML_OP_VIEW) {
-        return false;
-    }
-
-    if (node->op != graph_node_properties->node_op) {
-        return false;
-    }
-
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        if (node->ne[i] != graph_node_properties->ne[i]) {
-            return false;
-        }
-        if (node->nb[i] != graph_node_properties->nb[i]) {
-            return false;
-        }
-    }
-
-    for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (node->src[i] &&
-            node->src[i]->data != graph_node_properties->src_address[i] &&
-            node->op != GGML_OP_VIEW &&
-            !(node->op == GGML_OP_CPY && i == 1)
-        ) {
-            return false;
-        }
-    }
-
-    if ((node->op == GGML_OP_SCALE || node->op == GGML_OP_LATENT_ATTN) &&
-        memcmp(graph_node_properties->op_params, node->op_params, GGML_MAX_OP_PARAMS) != 0) {
-        return false;
-    }
-
-    return true;
-}
-
 static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph * cgraph) {
+
+    if (cgraph->uid != 0 && graph->uid == cgraph->uid) {
+        GGML_ASSERT(graph->ggml_graph_properties.size() == (size_t)cgraph->n_nodes);
+        return false;
+    }
 
     bool cuda_graph_update_required = false;
 
@@ -4514,15 +4595,15 @@ static bool is_cuda_graph_update_required(ggml_cuda_graph * graph, ggml_cgraph *
     // Loop over nodes in GGML graph to determine if CUDA graph update is required
     // and store properties to allow this comparison for the next token
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        bool has_matching_properties = true;
-        if (!cuda_graph_update_required) {
-            has_matching_properties = ggml_graph_node_has_matching_properties(cgraph->nodes[i], &graph->ggml_graph_properties[i]);
-        }
-        if (!has_matching_properties) {
+        ggml_graph_node_properties new_props;
+        set_ggml_graph_node_properties(cgraph->nodes[i], &new_props);
+        if (memcmp(&graph->ggml_graph_properties[i], &new_props, sizeof(new_props)) != 0) {
             cuda_graph_update_required = true;
+            memcpy(&graph->ggml_graph_properties[i], &new_props, sizeof(new_props));
         }
-        set_ggml_graph_node_properties(cgraph->nodes[i], &graph->ggml_graph_properties[i]);
     }
+
+    graph->uid = cgraph->uid;
 
     return cuda_graph_update_required;
 }
@@ -4727,6 +4808,8 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_GELU:
                 case GGML_UNARY_OP_GELU_ERF:
+                case GGML_UNARY_OP_ABS:
+                case GGML_UNARY_OP_SGN:
                 case GGML_UNARY_OP_SILU:
                 case GGML_UNARY_OP_SWIGLU:
                 case GGML_UNARY_OP_SWIGLU_OAI:
@@ -4841,6 +4924,9 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
             } break;
         case GGML_OP_GET_ROWS:
             {
+                if (op->type == op->src[0]->type) {
+                    return true;
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
@@ -5082,11 +5168,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_LATENT_ATTN:
             return ggml_cuda_latent_attn_is_supported(op);
         case GGML_OP_FLASH_ATTN_EXT:
-#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
-            return (op->src[0]->ne[0] == 64 && op->src[1]->type == GGML_TYPE_F16) || op->src[0]->ne[0] == 128;
-#else
             return ggml_cuda_fattn_is_supported(*cuda_ctx, op);
-#endif // defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
         default:
             return false;
     }
@@ -5121,7 +5203,7 @@ GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const
     //
     //           batch_size * active_experts >= min_batch_size * total_experts
     //
-    // as the condition for offloading model weights resinding in RAM to the GPU.
+    // as the condition for offloading model weights residing in RAM to the GPU.
     // In this case, the number of tokens is not as usual in op->ne[1] but rather in op->ne[2].
     if (op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_MOE_FUSED_UP_GATE) {
         if (ctx->offload_batch_size_per_byte >= 0) {

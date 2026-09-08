@@ -13,15 +13,15 @@ struct llama_model;
 #include <set>
 #include <memory>
 
-struct llama_openpangu_swa_window_view {
+struct llama_swa_window_view {
     int64_t w_view  = 0;
     int64_t win_off = 0;
     bool engaged    = false;
 };
 
-static inline llama_openpangu_swa_window_view llama_openpangu_calc_swa_window_view(
+static inline llama_swa_window_view llama_swa_calc_window_view(
         int64_t n_kv, int64_t n_tokens, int64_t window, int64_t pad) {
-    llama_openpangu_swa_window_view result;
+    llama_swa_window_view result;
     if (window <= 0 || n_kv <= 0) {
         result.w_view = n_kv;
         return result;
@@ -32,6 +32,19 @@ static inline llama_openpangu_swa_window_view llama_openpangu_calc_swa_window_vi
     result.w_view  = overcovered < n_kv ? overcovered : n_kv;
     result.win_off = n_kv - result.w_view;
     result.engaged = result.w_view < n_kv;
+    return result;
+}
+
+static inline llama_swa_window_view llama_swa_calc_window_view_compact(
+        int64_t live, int64_t sink_rows, int64_t n_tokens, int64_t window, int64_t pad) {
+    llama_swa_window_view result;
+    const int64_t live_padded = pad > 1 ? ((live + pad - 1) / pad) * pad : live;
+
+    const int64_t unpadded = window + pad + n_tokens;
+    const int64_t overcovered = pad > 1 ? ((unpadded + pad - 1) / pad) * pad : unpadded;
+    result.w_view  = overcovered < live_padded ? overcovered : live_padded;
+    result.win_off = sink_rows + live_padded - result.w_view;
+    result.engaged = true;
     return result;
 }
 
@@ -57,6 +70,9 @@ struct llama_kv_cell {
 
 // ring-buffer of cached KV data
 struct llama_kv_cache {
+    // the FA kernels require padding to avoid extra runtime boundary checks
+    static uint32_t get_padding(bool flash_attn) { return flash_attn ? 256u : 32u; }
+
     bool has_shift = false;
     bool do_defrag = false;
     bool do_copy   = false;
@@ -64,9 +80,8 @@ struct llama_kv_cache {
     bool hybrid    = false;
     bool v_trans   = true;  // the value tensor is transposed
 
-    // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent
-    // slots; Qwen3Next-style s_l handling (seq ops, state serialization, s_copy) must
-    // skip it. Speculative rollback snapshots/restores it via the whole-slot spec checkpoint.
+    // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent slots: qnext
+    // seq ops and generic serialization skip it, the openPangu state layouts carry it instead.
     bool s_l_position_strict = false;
 
     // Note: The value of head isn't only used to optimize searching
@@ -75,6 +90,28 @@ struct llama_kv_cache {
     uint32_t head = 0;
     uint32_t size = 0;
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    std::vector<uint32_t> row_count;
+
+    bool any_compacted() const { return !row_count.empty(); }
+
+    uint32_t rows(int il) const {
+        return row_count.empty() ? size : row_count[il];
+    }
+
+    bool is_compacted(int il) const {
+        return !row_count.empty() && row_count[il] < size;
+    }
+
+    // rows [sinks|window]; row(pos) = sink_rows + pos - pos_base_swa
+    // sink_rows == hparams.param_sink_number, which only the openPangu loader sets (0 elsewhere)
+    uint32_t  size_swa     = 0;
+    uint32_t  sink_rows    = 0;
+    uint32_t  window_swa   = 0;
+    uint32_t  head_swa     = 0;
+    llama_pos pos_base_swa = 0;
+
+    uint32_t live_swa() const { return head_swa - sink_rows; }
 
     // computed before each graph build
     uint32_t n = 0;
@@ -93,6 +130,10 @@ struct llama_kv_cache {
     // scoring representation so a decoded token scores against all past indexer keys.
     // Empty unless the model has the DSA indexer.
     std::vector<struct ggml_tensor *> kr_l;
+
+    // Pooled block keys for Qwen sparse attention: [indexer_head_size, kv_size/compress_ratio],
+    // already normalised and rotated. Empty unless the model scores blocks.
+    std::vector<struct ggml_tensor *> kp_l;
 
     // When true, the delta_net graph builder will enable per-step SSM state saves
     bool save_per_step_ssm = false;
@@ -150,12 +191,38 @@ struct llama_kv_cache {
         int64_t per_step_conv_dim = 0;
         int32_t per_step_d_conv = 0;
 
+        // DSV4 per-step compressor-state base and per-row deltas.
+        std::vector<ggml_tensor *> dsv4_per_step_state;
+        std::vector<ggml_tensor *> dsv4_per_step_state_shadow;
+        std::vector<ggml_tensor *> dsv4_per_step_delta;
+        std::vector<ggml_context *> dsv4_per_step_shadow_ctxs;
+        std::vector<ggml_backend_buffer_t> dsv4_per_step_shadow_bufs;
+        std::vector<int32_t> dsv4_per_step_csa_dst;
+        std::vector<int32_t> dsv4_per_step_hca_dst;
+        std::vector<int32_t> dsv4_per_step_lid_dst;
+        std::vector<int32_t> dsv4_per_step_csa_src;
+        std::vector<int32_t> dsv4_per_step_hca_src;
+        std::vector<int32_t> dsv4_per_step_lid_src;
+        bool dsv4_per_step_allocated = false;
+        bool dsv4_per_step_saved = false;
+        int32_t dsv4_per_step_max_tokens = 0;
+        size_t dsv4_per_step_base_bytes = 0;
+        size_t dsv4_per_step_delta_bytes = 0;
+
         int selected_spec_mode = -1;
         int fixed_spec_mode = LLAMA_SPEC_CKPT_NONE;
         int32_t fixed_max_tokens = 0;
 
         // Serialised sequence state for CPU mode
         std::vector<uint8_t> cpu_state_data;
+
+        // Private DSV4 state snapshot used by GPU/CPU fallback modes.
+        std::vector<std::vector<uint8_t>> dsv4_state_data;
+        std::vector<ggml_tensor *> dsv4_state_shadow;
+        std::vector<struct ggml_context *> dsv4_shadow_ctxs;
+        std::vector<ggml_backend_buffer_t> dsv4_shadow_bufs;
+        bool dsv4_shadow_allocated = false;
+        bool dsv4_shadow_saved = false;
 
         // Separate storage for per-step allocations
         std::vector<struct ggml_context *>   per_step_ctxs;
@@ -168,19 +235,41 @@ struct llama_kv_cache {
         bool shadow_conv_only = false;
         bool saved     = false;
 
-        ~gpu_checkpoint() {
+        void release_dsv4_per_step();
+        void release_dsv4_snapshot();
+
+        void release() {
+            release_dsv4_per_step();
+            release_dsv4_snapshot();
+
             for (struct ggml_context * ctx : shadow_ctxs) {
                 ggml_free(ctx);
             }
+            shadow_ctxs.clear();
             for (ggml_backend_buffer_t buf : shadow_bufs) {
                 ggml_backend_buffer_free(buf);
             }
+            shadow_bufs.clear();
+            s_l_shadow.clear();
+            split_s_l_shadow.clear();
+            allocated = false;
+            saved = false;
+
             for (struct ggml_context * ctx : per_step_ctxs) {
                 ggml_free(ctx);
             }
+            per_step_ctxs.clear();
             for (ggml_backend_buffer_t buf : per_step_bufs) {
                 ggml_backend_buffer_free(buf);
             }
+            per_step_bufs.clear();
+            per_step_ssm.clear();
+            per_step_conv.clear();
+            per_step_max_allocated = 0;
+        }
+
+        ~gpu_checkpoint() {
+            release();
         }
     };
 
@@ -375,6 +464,7 @@ struct llama_context {
             int32_t cache_graph_write_pos = 0;
             struct ggml_tensor * cache_input_target_features = nullptr;
             struct ggml_tensor * cache_input_pos_ctx = nullptr;
+            struct ggml_tensor * cache_input_rows = nullptr;
             struct ggml_tensor * kq_mask_tensor = nullptr;
             struct ggml_tensor * kq_mask_swa_tensor = nullptr;
             struct ggml_tensor * draft_tail_rows_tensor = nullptr;
@@ -383,6 +473,13 @@ struct llama_context {
         struct capture_state {
             std::vector<int32_t> layer_ids;
             std::vector<std::vector<float>> layer_rows;
+            struct capture_chunk {
+                int32_t row_offset = 0;
+                int32_t row_count = 0;
+                size_t byte_offset = 0;
+                ggml_type type = GGML_TYPE_COUNT;
+            };
+            std::vector<std::vector<capture_chunk>> layer_chunks;
             std::vector<int32_t> layer_rows_written;
             int32_t row_count = 0;
             int32_t row_width = 0;
@@ -408,11 +505,15 @@ struct llama_context {
         std::vector<float> feature_view_buffer;
         input_state inputs;
         int32_t visible_cross_ctx = 0;
+        bool dspark = false;
 
-        // Argmax token IDs from the DFlash draft graph, computed via GPU argmax.
-        // Populated in llama_decode_internal after graph compute.
         std::vector<llama_token> draft_tokens;
         struct ggml_tensor * draft_tokens_tensor = nullptr;
+        struct ggml_tensor * draft_lattice_tensor = nullptr;
+        struct ggml_tensor * draft_lattice_ids_tensor = nullptr;
+        std::vector<float> draft_lattice;
+        std::vector<int32_t> draft_lattice_ids;
+        int32_t draft_lattice_top_k = 0;
     };
     dflash_runtime dflash;
     using dflash_capture_state = dflash_runtime::capture_state;
@@ -471,6 +572,8 @@ struct llama_context {
 
         struct comp_plan {
             std::vector<int32_t> state_pos;
+            std::vector<int32_t> state_delta_src_idxs;
+            std::vector<int32_t> state_delta_dst_idxs;
             std::vector<int32_t> state_persist_src_idxs;
             std::vector<int32_t> state_persist_dst_idxs;
             std::vector<int32_t> state_read_idxs;
@@ -539,7 +642,7 @@ struct llama_context {
     struct ggml_tensor * inp_out_ids;     // I32 [n_outputs]
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
-    struct ggml_tensor * inp_KQ_mask_swa_win = nullptr; // F32 [openPangu SWA W_view, n_batch]
+    struct ggml_tensor * inp_KQ_mask_swa_win = nullptr; // F32 [SWA W_view, n_batch]
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls;         // I32 [n_batch]
@@ -547,6 +650,7 @@ struct llama_context {
     struct ggml_tensor * inp_s_mask;      // F32 [1, n_kv]
     struct ggml_tensor * inp_s_seq;       // I32 [n_kv, n_batch]
     struct ggml_tensor * inp_s_seq_qnext; // I32 [1, n_batch]
+    struct ggml_tensor * inp_ple_rows = nullptr; // I32 [ple_n_heads * n_batch], qwen4exp n-gram rows
     struct ggml_tensor * inp_pos_bucket;    // I32 [n_batch|n_kv, n_batch]
     struct ggml_tensor * inp_embd_enc;      // F32 [n_embd, n_outputs_enc]
     struct ggml_tensor * inp_KQ_mask_cross; // F32 [n_outputs_enc, n_batch]
@@ -555,15 +659,42 @@ struct llama_context {
     struct ggml_tensor * inp_mtp_carry = nullptr; // F32 [n_embd, nextn-1] per-head hidden at the last committed position
     struct ggml_tensor * inp_dsa_sink = nullptr; // F32 [n_kv, n_tokens] per-sequence attention-sink boost for DSA indexer top-k
 
-    struct openpangu_swa_window_view_state {
+    // Qwen sparse attention: everything that depends on cache layout is computed on the host,
+    // so the graph only gathers, pools and scores. One entry per distinct compress ratio.
+    struct qsa_input {
+        int32_t ratio    = 0;
+        struct ggml_tensor * cell_blk  = nullptr; // I32 [n_kv]           block each cell belongs to
+        struct ggml_tensor * bias      = nullptr; // F32 [n_kv, n_tokens] causal mask plus the tail boost
+        // only the blocks this ubatch writes into are pooled again; the rest are read from kp_l
+        struct ggml_tensor * win_blocks = nullptr; // I32 [n_win]         which block each entry rebuilds
+        struct ggml_tensor * win_cells  = nullptr; // I32 [ratio*n_win]   member cells of those blocks
+        struct ggml_tensor * win_pos    = nullptr; // I32 [4*n_win]       mrope position of those blocks
+        struct ggml_tensor * head_w     = nullptr; // F32 [n_idx_h, n_tokens] all ones; the head sum is unweighted
+    };
+    std::vector<qsa_input> inp_qsa;
+
+    // the pooled block keys no longer match the raw indexer keys and the next built graph must
+    // pool every block; set on state restore and defrag, cleared by that graph's host fill
+    bool qsa_pooled_stale = false;
+
+    // each sequence's recent tokens, read by the n-gram hash when a ubatch does not carry its
+    // first tokens' predecessors; trusted only while contiguous with the incoming position
+    struct ple_history {
+        llama_pos next_pos = -1;
+        std::vector<llama_token> toks;
+    };
+    std::map<llama_seq_id, ple_history> ple_hist;
+
+    struct swa_window_view_state {
         bool active       = false;
+        bool compacted    = false;
         int32_t n_kv      = 0;
         int32_t n_tokens  = 0;
         uint32_t window   = 0;
         uint32_t pad      = 0;
         int64_t w_view    = 0;
         int64_t win_off   = 0;
-    } openpangu_swa_window_view;
+    } swa_window_view;
 
     // multi-head MTP chaining state: head k's output row at the last committed position,
     // written back after each warmup/update decode and fed into the next MTP graph through
@@ -572,6 +703,8 @@ struct llama_context {
     // before the host buffer is read or resized.
     std::vector<float> mtp_carry;
     bool mtp_carry_pending = false;
+
+    std::vector<uint8_t> swa_compact_buf;
 
     ggml_backend_t ggml_backend_by_name(const char * name);
 
@@ -582,7 +715,7 @@ struct llama_context {
     int32_t mtp_n_heads = 0;
 
     void reset_scheduler();
-    bool can_reuse_graph(const llama_batch & u_batch);
+    bool can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash);
 
     struct CacheCopy {
         ggml_tensor * cpy = nullptr;

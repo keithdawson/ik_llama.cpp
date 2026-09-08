@@ -36,8 +36,7 @@ bandwidth on both sockets. Built for a 2× EPYC 9665 (2 nodes, 12 DDR5 channels 
 ## Validated defaults (already in the code — no action needed)
 
 - **Waiting policy auto-set**: mirror + `-ngl>0` defaults `OMP_WAIT_POLICY=PASSIVE` +
-  `GOMP_SPINCOUNT=5000` unless either is set by the user (+16% tg, pp-neutral on the
-  testbed). Tune the exact spin count per machine with `tune-spincount.sh`.
+  `GOMP_SPINCOUNT=7000` unless either is set by the user (confirmed on Pandora, 2026-09-07). Tune the exact spin count per machine with `tune-spincount.sh`.
 - **Hierarchical barrier gate** at `n_batch > 32` (`GGML_NUMA_HIER_BATCH_MAX` to sweep).
 - **CPU-count-weighted thread split**: nodes with fewer pinnable CPUs (e.g. after
   `GGML_NUMA_RESERVE_CPUS`) automatically get proportionally fewer threads; identical
@@ -45,9 +44,12 @@ bandwidth on both sockets. Built for a 2× EPYC 9665 (2 nodes, 12 DDR5 channels 
 - 7 upstream fixes cherry-picked (gemma-4 `-ngl 0` silent failure, CUDA MUL/contiguity,
   CUDA discrepancies) — see `git log --grep=cherry` / commits around `ba68f029`.
 
+Individual-CPU pinning is now the mirror default following user testing (2026-09-07).
+Set `GGML_NUMA_PIN=node` for node-wide affinity.
+
 ## Default-off knobs awaiting on-target validation
 
-`GGML_NUMA_NT_COPY`, `GGML_NUMA_HIER_BATCH_MAX` (≠32), `GGML_NUMA_PIN=cpu`,
+`GGML_NUMA_NT_COPY`, `GGML_NUMA_HIER_BATCH_MAX` (≠32),
 `GGML_NUMA_RESERVE_CPUS`, `GGML_NUMA_COPY_THREADS` (≠16), `GGML_NUMA_HUGETLB`,
 `--numa-bind-compute`. Each has a `pandora-tune.sh` subcommand; the testbed verdicts
 (docs/numa-testbed.md table) say what to expect.

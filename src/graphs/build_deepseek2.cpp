@@ -302,6 +302,13 @@ ggml_tensor * llm_build_context::build_deepseek2_tp_attention(
             kqv_2d = ggml_reshape_2d(ctx0, kqv, n_embd_head_v * n_head_local, n_tokens);
         }
 
+        if (model.layers[il].wqkv_gate) {
+            auto gate_split = (const ggml_split_tensor_t *) model.layers[il].wqkv_gate->extra;
+            GGML_ASSERT(gate_split && gate_split->splits[id]);
+            kqv_2d = build_mla_output_gate(lctx, ctx0, kqv_2d, cur, gate_split->splits[id],
+                    n_embd_head_v, n_head_local, il_id, cb);
+        }
+
         ggml_tensor * partial = llm_build_lora_mm(lctx, ctx0, wo_split->splits[id], kqv_2d);
 
         // Fold residual into the first non-skipped rank so the reduce result includes it.
@@ -728,6 +735,7 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
     // norm
     cur = llm_build_norm(ctx0, inpL, hparams, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, cb, il);
     cb(cur, "attn_norm", il);
+    auto input_normed = cur;
 
     // DSA lightning indexer (GLM-5.2 / DeepSeek-V3.2). Built below from the q_lora latent
     // and used to construct a sparse causal mask. Defaults to the dense KQ_mask.
@@ -1160,6 +1168,10 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
 
             }
 
+            if (model.layers[il].wqkv_gate) {
+                cur = build_mla_output_gate(lctx, ctx0, cur, input_normed, model.layers[il].wqkv_gate,
+                        n_embd_head_v, n_head, il, cb);
+            }
             ggml_build_forward_expand(gf, cur);
 
             cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
@@ -1200,9 +1212,19 @@ ggml_tensor * llm_build_context::build_deepseek2_layer_attention(
             struct ggml_tensor * k_states = ggml_concat(ctx0, k_nope, ggml_repeat(ctx0, k_rope, q_rope), 0);
             cb(k_states, "k_states", il);
 
-            cur = llm_build_kv(ctx0, lctx, kv_self, gf,
-                    model.layers[il].wo, NULL,
-                    k_states, v_states, q_states, KQ_mask, n_tokens, kv_head, n_kv, kq_scale, cb, il);
+            if (model.layers[il].wqkv_gate) {
+                cur = llm_build_kv(ctx0, lctx, kv_self, gf,
+                        nullptr, nullptr,
+                        k_states, v_states, q_states, KQ_mask, n_tokens, kv_head, n_kv, kq_scale, cb, il);
+                cur = build_mla_output_gate(lctx, ctx0, cur, input_normed, model.layers[il].wqkv_gate,
+                        n_embd_head_v, n_head, il, cb);
+                cur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wo, cur);
+                cb(cur, "kqv_out", il);
+            } else {
+                cur = llm_build_kv(ctx0, lctx, kv_self, gf,
+                        model.layers[il].wo, nullptr,
+                        k_states, v_states, q_states, KQ_mask, n_tokens, kv_head, n_kv, kq_scale, cb, il);
+            }
 
         }
     }
@@ -1285,17 +1307,7 @@ ggml_cgraph * llm_build_context::build_deepseek2() {
             GGML_ABORT("MTP tail is only wired for GLM_DSA models with NextN layers enabled");
         }
 
-        ggml_tensor * hidden_states_from_main_model;
-
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
-        }
-        ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
-        ggml_set_input(hidden_states_from_main_model);
-
-        lctx.inp_mtp_states = hidden_states_from_main_model;
+        ggml_tensor * hidden_states_from_main_model = build_inp_mtp_states(hparams.n_embd);
 
         const int il_mtp = hparams.n_layer - 1;
         const auto & mtp_layer = model.layers[il_mtp];
@@ -1452,17 +1464,11 @@ struct ggml_tensor * llm_build_context::build_deepseek2_mtp(
     }
     ggml_tensor * token_emb = build_inp_embd_mtp(mtp_embd_weights);
 
-    // Normalize and project
-    ggml_tensor * token_emb_norm = llm_build_norm(ctx0, token_emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il);
-    ggml_tensor * hidden_state_norm = llm_build_norm(ctx0, prev_embeddings, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il);
-
     if (mtp_layer.nextn.eh_proj == nullptr) {
         GGML_ABORT("GLM_DSA MTP requires nextn.eh_proj");
     }
 
-    ggml_tensor * combined = ggml_concat(ctx0, token_emb_norm, hidden_state_norm, 0);
-    cb(combined, "mtp_concat", il);
-    ggml_tensor * cur = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
+    ggml_tensor * cur = build_mtp_input(mtp_layer, prev_embeddings, token_emb, il, nullptr);
 
     struct ggml_tensor * inpSA = cur;
 

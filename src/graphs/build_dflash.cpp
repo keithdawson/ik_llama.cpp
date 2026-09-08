@@ -4,6 +4,113 @@
 
 #include <cmath>
 
+static ggml_tensor * build_dflash2_conv(
+        llm_build_context & g,
+        ggml_tensor * hidden,
+        ggml_tensor * dynamic,
+        ggml_tensor * base,
+        int side) {
+    const int64_t hidden_size = hidden->ne[0];
+    const int64_t n_tokens = hidden->ne[1];
+    const int64_t kernel_size = g.hparams.dflash_conv_kernel_size;
+    const int64_t group_size = g.hparams.dflash_conv_group_size;
+    const int64_t n_groups = hidden_size / group_size;
+    const int64_t n_blocks = 1;
+    const int64_t block_size = n_tokens / n_blocks;
+
+    GGML_ASSERT(n_tokens > 0 && n_tokens % n_blocks == 0);
+    GGML_ASSERT(hidden_size % group_size == 0);
+    GGML_ASSERT(dynamic != nullptr && base != nullptr);
+    GGML_ASSERT(side >= 0 && side < 2);
+
+    ggml_context * ctx0 = g.ctx0;
+    hidden = ggml_cont_2d(ctx0, hidden, hidden_size, n_tokens);
+    dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
+    ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
+    ggml_tensor * grouped = ggml_reshape_3d(ctx0, hidden, group_size, n_groups, n_tokens);
+    ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
+    ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
+            coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
+
+    ggml_tensor * result = nullptr;
+    for (int64_t tap = 0; tap < kernel_size; ++tap) {
+        ggml_tensor * values = blocks;
+        if (tap > 0) {
+            ggml_tensor * zeros = ggml_fill(ctx0,
+                    ggml_new_tensor_3d(ctx0, hidden->type, hidden_size, std::min(tap, block_size), n_blocks), 0.0f);
+            if (tap < block_size) {
+                ggml_tensor * previous = ggml_view_3d(ctx0, blocks, hidden_size, block_size - tap, n_blocks,
+                        blocks->nb[1], blocks->nb[2], 0);
+                values = ggml_concat(ctx0, zeros, previous, 1);
+            } else {
+                values = zeros;
+            }
+        }
+        values = ggml_reshape_2d(ctx0, values, hidden_size, n_tokens);
+
+        ggml_tensor * coeff = ggml_view_2d(ctx0, coeffs_side, n_groups, n_tokens,
+                coeffs_side->nb[2], tap * coeffs_side->nb[1]);
+        coeff = ggml_cont(ctx0, coeff);
+        coeff = ggml_reshape_3d(ctx0, coeff, 1, n_groups, n_tokens);
+        coeff = ggml_reshape_2d(ctx0, ggml_repeat(ctx0, coeff, grouped), hidden_size, n_tokens);
+
+        ggml_tensor * base_tap = ggml_view_1d(ctx0, base, hidden_size,
+                tap * base->nb[1] + side * base->nb[2]);
+        ggml_tensor * weight = ggml_add(ctx0, coeff, ggml_repeat(ctx0, base_tap, hidden));
+        ggml_tensor * term = ggml_mul(ctx0, weight, values);
+        result = result ? ggml_add(ctx0, result, term) : term;
+    }
+    return result;
+}
+
+ggml_tensor * llm_build_context::build_dspark_logits(
+        llm_build_context & llm,
+        ggml_tensor * base_logits,
+        ggml_tensor * input_tokens,
+        ggml_tensor ** draft_tokens_out) {
+    ggml_context * ctx0 = llm.ctx0;
+    const llama_model & model = llm.model;
+
+    GGML_ASSERT(model.dspark_markov_w1 != nullptr);
+    GGML_ASSERT(model.dspark_markov_w2 != nullptr);
+    GGML_ASSERT(input_tokens != nullptr);
+    GGML_ASSERT(base_logits->ne[1] == input_tokens->ne[0]);
+
+    const int64_t n_vocab  = base_logits->ne[0];
+    const int64_t n_tokens = base_logits->ne[1];
+    GGML_ASSERT(n_tokens > 0);
+
+    ggml_tensor * previous = ggml_view_1d(ctx0, input_tokens, 1, 0);
+    ggml_tensor * chained = nullptr;
+    ggml_tensor * draft_tokens = nullptr;
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        ggml_tensor * markov_w1 = ggml_get_rows_ext(
+                ctx0, model.dspark_markov_w1, previous, true, false);
+        ggml_tensor * markov_bias = ggml_mul_mat(ctx0, model.dspark_markov_w2, markov_w1);
+        ggml_tensor * base_row = ggml_view_2d(
+                ctx0,
+                base_logits,
+                n_vocab,
+                1,
+                base_logits->nb[1],
+                (size_t) i * base_logits->nb[1]);
+        ggml_tensor * biased_row = ggml_add(ctx0, base_row, markov_bias);
+        ggml_tensor * token = ggml_argmax(ctx0, biased_row);
+
+        chained = chained == nullptr ? biased_row : ggml_concat(ctx0, chained, biased_row, 1);
+        draft_tokens = draft_tokens == nullptr ? token : ggml_concat(ctx0, draft_tokens, token, 0);
+        if (i + 1 < n_tokens) {
+            previous = token;
+        }
+    }
+
+    if (draft_tokens_out != nullptr) {
+        *draft_tokens_out = draft_tokens;
+    }
+    return chained;
+}
+
 ggml_cgraph * llm_build_context::build_dflash_kv_cache() {
     const int64_t n_embd_head_k = hparams.n_embd_head_k(0);
     const int64_t n_embd_head_v = hparams.n_embd_head_v(0);
@@ -29,6 +136,14 @@ ggml_cgraph * llm_build_context::build_dflash_kv_cache() {
     lctx.dflash.kv.cache_input_pos_ctx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, update_rows);
     ggml_set_input(lctx.dflash.kv.cache_input_pos_ctx);
     cb(lctx.dflash.kv.cache_input_pos_ctx, "dflash_kv_input_pos_ctx", -1);
+
+    if (hparams.dflash_dsv4) {
+        lctx.dflash.kv.cache_input_rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, update_rows);
+        ggml_set_input(lctx.dflash.kv.cache_input_rows);
+        cb(lctx.dflash.kv.cache_input_rows, "dflash_kv_input_rows", -1);
+    } else {
+        lctx.dflash.kv.cache_input_rows = nullptr;
+    }
 
     ggml_tensor * target_features = lctx.dflash.kv.cache_input_target_features;
     if (hparams.dflash_laguna) {
@@ -63,8 +178,47 @@ ggml_cgraph * llm_build_context::build_dflash_kv_cache() {
     }
 
     ggml_tensor * fused_target = llm_build_lora_mm(lctx, ctx0, model.dflash_fc, target_features);
-    fused_target = llm_build_norm(ctx0, fused_target, hparams, model.dflash_hidden_norm, nullptr, LLM_NORM_RMS, cb, -1);
+    fused_target = llm_build_norm(ctx0, fused_target, hparams,
+            model.dflash_hidden_norm, nullptr, LLM_NORM_RMS, cb, -1);
     cb(fused_target, "dflash_kv_fused_target", -1);
+
+    if (hparams.dflash_dsv4) {
+        const int64_t n_embd_head = hparams.n_embd_head_k(0);
+        const int64_t n_embd_head_rope = hparams.n_rot;
+        const int64_t n_embd_head_nope = n_embd_head - n_embd_head_rope;
+
+        GGML_ASSERT(n_embd_head_nope > 0);
+        GGML_ASSERT(hparams.n_head_kv() == 1);
+
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & layer = model.layers[il];
+            GGML_ASSERT(layer.wkv_latent != nullptr);
+            GGML_ASSERT(layer.attn_kv_norm != nullptr);
+
+            ggml_tensor * kv = llm_build_lora_mm(lctx, ctx0, layer.wkv_latent, fused_target);
+            kv = llm_build_norm(ctx0, kv, hparams, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, cb, il);
+            kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, update_rows);
+
+            kv = ggml_rope_ext_inplace(ctx0, kv, lctx.dflash.kv.cache_input_pos_ctx, nullptr,
+                    n_embd_head_rope, rope_type, 0, freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            kv->op_params[15] = 1;
+            cb(kv, "dflash_dsv4_kv_injected", il);
+            kv = ggml_permute(ctx0, kv, 0, 2, 1, 3);
+
+            GGML_ASSERT(lctx.dflash.kv.k_ctx_cache[il] != nullptr);
+            GGML_ASSERT(lctx.dflash.kv.v_ctx_cache[il] != nullptr);
+            ggml_tensor * Kcur = ggml_set_rows(ctx0, lctx.dflash.kv.k_ctx_cache[il], kv,
+                    lctx.dflash.kv.cache_input_rows);
+            ggml_tensor * Vcur = ggml_set_rows(ctx0, lctx.dflash.kv.v_ctx_cache[il], kv,
+                    lctx.dflash.kv.cache_input_rows);
+            cb(Kcur, "dflash_dsv4_k_set_rows", il);
+            cb(Vcur, "dflash_dsv4_v_set_rows", il);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
+        }
+
+        return gf;
+    }
 
     for (int il = 0; il < n_layer; ++il) {
         GGML_ASSERT(il < (int32_t) lctx.dflash.kv.k_ctx_cache.size());
@@ -201,13 +355,18 @@ ggml_cgraph * llm_build_context::build_dflash_kv_cache() {
 }
 
 ggml_cgraph * llm_build_context::build_dflash() {
+    if (hparams.dflash_dsv4) {
+        return build_dflash_dsv4();
+    }
+
     const int64_t n_embd_head_k = hparams.n_embd_head_k(0);
     const int64_t n_embd_head_v = hparams.n_embd_head_v(0);
     const int64_t n_target_features = hparams.dflash_n_target_features;
+    const bool is_dflash2 = model.arch == LLM_ARCH_DFLASH2;
     const int64_t ctx_len = lctx.dflash.visible_cross_ctx > 0
             ? (int64_t) lctx.dflash.visible_cross_ctx
             : std::max<int64_t>(1, (int64_t) cparams.n_ctx - (int64_t) hparams.dflash_block_size);
-    const int64_t n_kv_total = GGML_PAD(ctx_len + n_tokens, flash_attn ? 256 : 32);
+    const int64_t n_kv_total = GGML_PAD(ctx_len + n_tokens, (int64_t) llama_kv_cache::get_padding(flash_attn));
 
     GGML_ASSERT(n_embd_head_k == n_embd_head_v);
     GGML_ASSERT(n_target_features > 0);
@@ -269,7 +428,8 @@ ggml_cgraph * llm_build_context::build_dflash() {
 
     ggml_tensor * inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, tok_embd, cb);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = (n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
+    ggml_tensor * inp_out_ids = (!llm_arch_requires_all_graph_output_rows(model.arch) &&
+            n_tokens > 1 && n_outputs < n_tokens) ? build_inp_out_ids() : nullptr;
 
     const float kq_scale = 1.0f / std::sqrt((float) n_embd_head_k);
 
@@ -279,6 +439,13 @@ ggml_cgraph * llm_build_context::build_dflash() {
         ggml_tensor * cur = llm_build_norm(ctx0, inpL, hparams, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, cb, il);
         cb(cur, "attn_norm", il);
         ggml_tensor * input_normed = cur;
+
+        ggml_tensor * attn_dynamic = nullptr;
+        if (is_dflash2) {
+            attn_dynamic = llm_build_lora_mm(lctx, ctx0, model.layers[il].dflash_attn_conv_proj, cur);
+            cur = build_dflash2_conv(*this, cur, attn_dynamic, model.layers[il].dflash_attn_conv_base, 0);
+            cb(cur, "dflash2_attn_conv_in", il);
+        }
 
         ggml_tensor * Qcur = llm_build_lora_mm(lctx, ctx0, model.layers[il].wq, cur);
         ggml_tensor * Kcur_noise = llm_build_lora_mm(lctx, ctx0, model.layers[il].wk, cur);
@@ -404,6 +571,11 @@ ggml_cgraph * llm_build_context::build_dflash() {
         if (model.layers[il].bo) { cur = ggml_add(ctx0, cur, model.layers[il].bo); }
         cb(cur, "kqv_out", il);
 
+        if (is_dflash2) {
+            cur = build_dflash2_conv(*this, cur, attn_dynamic, model.layers[il].dflash_attn_conv_base, 1);
+            cb(cur, "dflash2_attn_conv_out", il);
+        }
+
         cur = ggml_add(ctx0, cur, inpSA);
         cb(cur, "attn_residual", il);
 
@@ -413,8 +585,16 @@ ggml_cgraph * llm_build_context::build_dflash() {
         }
 
         ggml_tensor * ffn_residual = cur;
-        cur = llm_build_norm(ctx0, cur, hparams, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, cb, il);
-        cb(cur, "attn_post_norm", il);
+        ggml_tensor * ffn_dynamic = nullptr;
+        if (is_dflash2) {
+            cur = llm_build_norm(ctx0, cur, hparams, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
+            ffn_dynamic = llm_build_lora_mm(lctx, ctx0, model.layers[il].dflash_ffn_conv_proj, cur);
+            cur = build_dflash2_conv(*this, cur, ffn_dynamic, model.layers[il].dflash_ffn_conv_base, 0);
+            cb(cur, "dflash2_ffn_conv_in", il);
+        } else {
+            cur = llm_build_norm(ctx0, cur, hparams, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, cb, il);
+            cb(cur, "attn_post_norm", il);
+        }
 
         cur = llm_build_ffn(ctx0, lctx, nullptr, cur,
                 model.layers[il].ffn_up, nullptr, nullptr,
@@ -424,6 +604,11 @@ ggml_cgraph * llm_build_context::build_dflash() {
                 LLM_FFN_SILU, LLM_FFN_PAR, cb, il, gf, false, false);
         cb(cur, "ffn_out", il);
 
+        if (is_dflash2) {
+            cur = build_dflash2_conv(*this, cur, ffn_dynamic, model.layers[il].dflash_ffn_conv_base, 1);
+            cb(cur, "dflash2_ffn_conv_out", il);
+        }
+
         cur = ggml_add(ctx0, cur, ffn_residual);
         cb(cur, "l_out", il);
 
@@ -432,12 +617,97 @@ ggml_cgraph * llm_build_context::build_dflash() {
 
     GGML_ASSERT(model.output_mtp != nullptr);
     ggml_tensor * result = build_output(lctx, ctx0, inpL, model.output_mtp, model.output_norm, cb);
-    cb(result, "result_output", -1);
+    if (is_dflash2) {
+        if (hparams.f_logit_scale != 0.0f) {
+            result = ggml_scale(ctx0, result, hparams.f_logit_scale);
+        }
+        if (hparams.f_final_logit_softcapping > 0.0f) {
+            result = ggml_softcap(ctx0, result,
+                    1.0f / hparams.f_final_logit_softcapping,
+                    hparams.f_final_logit_softcapping);
+        }
+    }
+    if (lctx.dflash.dspark) {
+        cb(result, "dflash_base_result_output", -1);
+    } else {
+        cb(result, "result_output", -1);
+    }
     ggml_build_forward_expand(gf, result);
 
     lctx.dflash.draft_tokens_tensor = nullptr;
-    ggml_tensor * draft_tokens = ggml_argmax(ctx0, result);
+    lctx.dflash.draft_lattice_tensor = nullptr;
+    lctx.dflash.draft_lattice_ids_tensor = nullptr;
+    lctx.dflash.draft_lattice_top_k = 0;
+
+    if (is_dflash2) {
+        const int64_t top_k = hparams.dflash_selector_top_k;
+        const int64_t rank = hparams.dflash_selector_rank;
+        const int64_t lattice_width = top_k * top_k;
+        const int64_t result_tokens = result->ne[1];
+        GGML_ASSERT(lctx.inp_tokens != nullptr);
+
+        ggml_tensor * candidates = ggml_top_k(ctx0, result, top_k);
+        candidates = ggml_cont_2d(ctx0, candidates, top_k, result_tokens);
+        ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, result, 1, result->ne[0], result_tokens);
+        ggml_tensor * unary_rows = ggml_get_rows(ctx0, logits_rows, candidates);
+        ggml_tensor * unary = ggml_reshape_2d(ctx0,
+                unary_rows, top_k, result_tokens);
+        ggml_tensor * hidden = llm_build_norm(ctx0, inpL, hparams, model.output_norm, nullptr, LLM_NORM_RMS, cb, -1);
+        hidden = llm_build_lora_mm(lctx, ctx0, model.dflash_selector_hidden, hidden);
+
+        ggml_tensor * packed = ggml_fill(ctx0,
+                ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, lattice_width, 1), 0.0f);
+        const int64_t block_size = std::min<int64_t>(result_tokens, hparams.dflash_block_size);
+        ggml_tensor * anchor = ggml_view_1d(ctx0, lctx.inp_tokens, 1, 0);
+
+        for (int64_t pos = 1; pos < block_size; ++pos) {
+            ggml_tensor * ids = ggml_cont_2d(ctx0,
+                    ggml_view_2d(ctx0, candidates, top_k, 1, candidates->nb[1], pos * candidates->nb[1]),
+                    top_k, 1);
+            ggml_tensor * unary_pos = ggml_cont_2d(ctx0,
+                    ggml_view_2d(ctx0, unary, top_k, 1, unary->nb[1], pos * unary->nb[1]),
+                    top_k, 1);
+            ggml_tensor * successor = ggml_get_rows(ctx0, model.dflash_selector_next, ids);
+            ggml_tensor * hidden_pos = ggml_cont_2d(ctx0,
+                    ggml_view_2d(ctx0, hidden, rank, 1, hidden->nb[1], pos * hidden->nb[1]), rank, 1);
+
+            ggml_tensor * predecessor = pos == 1
+                ? ggml_get_rows(ctx0, model.dflash_selector_prev, anchor)
+                : ggml_get_rows(ctx0, model.dflash_selector_prev,
+                        ggml_view_2d(ctx0, candidates, top_k, 1, candidates->nb[1], (pos - 1) * candidates->nb[1]));
+            ggml_tensor * hidden_repeat = ggml_repeat(ctx0, hidden_pos, predecessor);
+            ggml_tensor * conditioned = ggml_mul(ctx0, predecessor, hidden_repeat);
+            ggml_tensor * scores = ggml_mul_mat(ctx0, successor, conditioned);
+            if (pos == 1) {
+                scores = ggml_repeat_4d(ctx0, scores, top_k, top_k, 1, 1);
+            }
+            ggml_tensor * unary_repeat = ggml_repeat(ctx0,
+                    ggml_reshape_3d(ctx0, unary_pos, top_k, 1, 1), scores);
+            scores = ggml_add(ctx0, scores, unary_repeat);
+
+            ggml_tensor * row = ggml_reshape_2d(ctx0, scores, lattice_width, 1);
+            packed = ggml_concat(ctx0, packed, row, 1);
+        }
+
+        cb(packed, "dflash2_lattice", -1);
+        ggml_build_forward_expand(gf, packed);
+        cb(candidates, "dflash2_lattice_ids", -1);
+        ggml_set_output(candidates);
+        ggml_build_forward_expand(gf, candidates);
+        lctx.dflash.draft_lattice_tensor = packed;
+        lctx.dflash.draft_lattice_ids_tensor = candidates;
+        lctx.dflash.draft_lattice_top_k = (int32_t) top_k;
+    }
+
+    ggml_tensor * draft_tokens = nullptr;
+    if (lctx.dflash.dspark) {
+        result = build_dspark_logits(*this, result, lctx.inp_tokens, &draft_tokens);
+        cb(result, "result_output", -1);
+    } else {
+        draft_tokens = ggml_argmax(ctx0, result);
+    }
     ggml_set_name(draft_tokens, "draft_argmax");
+    ggml_build_forward_expand(gf, result);
     ggml_build_forward_expand(gf, draft_tokens);
     lctx.dflash.draft_tokens_tensor = draft_tokens;
 

@@ -17,8 +17,8 @@ static __global__ void k_get_rows(
             /*size_t nb00,*/ size_t nb01, size_t nb02, size_t nb03,
             size_t s10, size_t s11, size_t s12/*, size_t s13*/) {
 
-    const int i00 = (blockIdx.x*blockDim.x + threadIdx.x)*2;
-    const int i10 = blockDim.y*blockIdx.y + threadIdx.y;
+    const int i00 = (blockIdx.y*blockDim.x + threadIdx.x)*2;
+    const int i10 =  blockIdx.x*blockDim.y + threadIdx.y;
     const int i11 = (blockIdx.z*blockDim.z + threadIdx.z)/ne12;
     const int i12 = (blockIdx.z*blockDim.z + threadIdx.z)%ne12;
 
@@ -57,8 +57,8 @@ static __global__ void k_get_rows_float(
             /*size_t nb00,*/ size_t nb01, size_t nb02, size_t nb03,
             size_t s10, size_t s11, size_t s12/*, size_t s13*/) {
 
-    const int i00 = blockIdx.x*blockDim.x + threadIdx.x;
-    const int i10 = blockDim.y*blockIdx.y + threadIdx.y;
+    const int i00 =  blockIdx.y*blockDim.x + threadIdx.x;
+    const int i10 =  blockIdx.x*blockDim.y + threadIdx.y;
     const int i11 = (blockIdx.z*blockDim.z + threadIdx.z)/ne12;
     const int i12 = (blockIdx.z*blockDim.z + threadIdx.z)%ne12;
 
@@ -81,7 +81,8 @@ static void get_rows_cuda(const ggml_tensor * src0, const ggml_tensor * src1, gg
 
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
     const int block_num_x = (ne00 + 2*CUDA_GET_ROWS_BLOCK_SIZE - 1) / (2*CUDA_GET_ROWS_BLOCK_SIZE);
-    const dim3 block_nums(block_num_x, ne10, ne11*ne12);
+    GGML_ASSERT(ne11*ne12 < 65536);
+    const dim3 block_nums(ne10, block_num_x, ne11*ne12);
 
     // strides in elements
     //const size_t s0 = nb0 / ggml_element_size(dst);
@@ -115,7 +116,8 @@ static void get_rows_cuda_float(const ggml_tensor * src0, const ggml_tensor * sr
 
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
     const int block_num_x = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
-    const dim3 block_nums(block_num_x, ne10, ne11*ne12);
+    GGML_ASSERT(ne11*ne12 < 65536);
+    const dim3 block_nums(ne10, block_num_x, ne11*ne12);
 
     // strides in elements
     //const size_t s0 = nb0 / ggml_element_size(dst);
@@ -139,6 +141,34 @@ static void get_rows_cuda_float(const ggml_tensor * src0, const ggml_tensor * sr
     GGML_UNUSED(dst);
 }
 
+template <typename data_t>
+static __global__ void k_get_rows_dim0(int n,
+        size_t nb01, size_t nb02, size_t nb03, size_t nb11, size_t nb12, size_t nb13, size_t nb1, size_t nb2, size_t nb3,
+        const data_t * __restrict__ src, const int * __restrict__ idx, data_t * __restrict__ dst) {
+    int i1 = blockIdx.x;
+    int i2 = blockIdx.y;
+    int i3 = blockIdx.z;
+    src += nb01*i1 + nb02*i2 + nb03*i3;
+    idx += nb11*i1 + nb12*i2 + nb13*i3;
+    dst +=  nb1*i1 +  nb2*i2 +  nb3*i3;
+
+    for (int j = threadIdx.x; j < n; j += blockDim.x) dst[j] = src[idx[j]];
+}
+
+template <typename data_t>
+static __global__ void k_get_rows_dim1(int n,
+        size_t nb01, size_t nb02, size_t nb03, size_t nb11, size_t nb12, size_t nb1, size_t nb2, size_t nb3,
+        const data_t * __restrict__ src, const int * __restrict__ idx, data_t * __restrict__ dst) {
+    int i1 = blockIdx.x;
+    int i2 = blockIdx.y;
+    int i3 = blockIdx.z;
+    idx += nb11*i2 + nb12*i3;
+    src += nb01*idx[i1] + nb02*i2 + nb03*i3;
+    dst +=  nb1*i1 +  nb2*i2 +  nb3*i3;
+
+    for (int j = threadIdx.x; j < n; j += blockDim.x) dst[j] = src[j];
+}
+
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -147,8 +177,60 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float * dst_d = (float *)dst->data;
     cudaStream_t stream = ctx.stream();
 
-
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
+
+    if (dst->type != GGML_TYPE_F32 || dst->op_params[0] == 1) {
+        constexpr int k_block_size = 512;
+        GGML_ASSERT(src0->type == dst->type);
+        if (dst->op_params[0] == 1) {
+            //printf("%s(%s, %s) - dim0\n", __func__, src0->name, ggml_type_name(src0->type));
+            GGML_ASSERT(src0->ne[1] == src1->ne[1] && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3]);
+            GGML_ASSERT(src0->ne[0] >= src1->ne[0]);
+            GGML_ASSERT(dst->ne[0] == src1->ne[0]);
+            auto type_size = ggml_type_size(dst->type);
+            GGML_ASSERT(type_size == 2 || type_size == 4);
+            dim3 grid(dst->ne[1], dst->ne[2], dst->ne[3]);
+            if (type_size == 2) {
+                k_get_rows_dim0<<<grid, k_block_size, 0, ctx.stream()>>>(dst->ne[0],
+                        src0->nb[1]/type_size, src0->nb[2]/type_size, src0->nb[3]/type_size,
+                        src1->nb[1]/type_size, src1->nb[2]/type_size, src1->nb[3]/type_size,
+                         dst->nb[1]/type_size,  dst->nb[2]/type_size, dst->nb[3]/type_size,
+                        (const uint16_t *)src0->data, (const int *)src1->data, (uint16_t *)dst->data);
+            } else {
+                k_get_rows_dim0<<<grid, k_block_size, 0, ctx.stream()>>>(dst->ne[0],
+                        src0->nb[1]/type_size, src0->nb[2]/type_size, src0->nb[3]/type_size,
+                        src1->nb[1]/type_size, src1->nb[2]/type_size, src1->nb[3]/type_size,
+                         dst->nb[1]/type_size,  dst->nb[2]/type_size,  dst->nb[3]/type_size,
+                        (const uint32_t *)src0->data, (const int *)src1->data, (uint32_t *)dst->data);
+            }
+        } else {
+            //printf("%s(%s, %s) - dim1\n", __func__, src0->name, ggml_type_name(src0->type));
+            GGML_ASSERT(src0->ne[2] == src1->ne[1]);
+            GGML_ASSERT(src0->ne[3] == src1->ne[2]);
+            GGML_ASSERT(src0->ne[3] == 1);
+            GGML_ASSERT(dst->ne[0] == src0->ne[0] && dst->ne[1] == src1->ne[0] && dst->ne[2] == src1->ne[1] && dst->ne[2]);
+
+            auto row_size = ggml_row_size(dst->type, dst->ne[0]);
+            GGML_ASSERT(row_size % 2 == 0);
+            auto type_size = row_size % 4 == 0 ? 4 : 2;
+            dim3 grid(dst->ne[1], dst->ne[2], dst->ne[3]);
+            if (type_size == 2) {
+                k_get_rows_dim1<<<grid, k_block_size, 0, ctx.stream()>>>(row_size/type_size,
+                        src0->nb[1]/type_size, src0->nb[2]/type_size, src0->nb[3]/type_size,
+                        src1->nb[1]/type_size, src1->nb[2]/type_size,
+                         dst->nb[1]/type_size,  dst->nb[2]/type_size, dst->nb[3]/type_size,
+                        (const uint16_t *)src0->data, (const int *)src1->data, (uint16_t *)dst->data);
+            } else {
+                k_get_rows_dim1<<<grid, k_block_size, 0, ctx.stream()>>>(row_size/type_size,
+                        src0->nb[1]/type_size, src0->nb[2]/type_size, src0->nb[3]/type_size,
+                        src1->nb[1]/type_size, src1->nb[2]/type_size,
+                         dst->nb[1]/type_size,  dst->nb[2]/type_size,  dst->nb[3]/type_size,
+                        (const uint32_t *)src0->data, (const int *)src1->data, (uint32_t *)dst->data);
+            }
+        }
+        return;
+    }
+
     GGML_ASSERT(dst->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32));
 
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));

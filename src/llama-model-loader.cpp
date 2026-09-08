@@ -662,6 +662,15 @@ bool llama_model_loader::should_defer_expert_mmaps() const {
     return defer_experts && use_mmap && !expert_tensor_index.empty();
 }
 
+bool llama_model_loader::has_anonymous_mapping() const {
+    for (const auto & mapping : mappings) {
+        if (mapping->is_anonymous()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void llama_model_loader::drop_mmap_expert_pages() const {
     if (!use_mmap || mappings.empty() || expert_tensor_index.file_ranges.empty()) {
         return;
@@ -671,6 +680,35 @@ void llama_model_loader::drop_mmap_expert_pages() const {
     for (size_t idx = 0; idx < n_range_sets; ++idx) {
         const auto & ranges = expert_tensor_index.file_ranges[idx];
         for (const auto & range : ranges) {
+            mappings[idx]->dontneed_fragment(range.first, range.last);
+        }
+    }
+}
+
+void llama_model_loader::build_ple_tensor_index() {
+    ple_tensor_index = {};
+
+    const auto * weight = get_weight(LLM_TN(get_arch())(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").c_str());
+    if (weight == nullptr) {
+        return;
+    }
+
+    const size_t tensor_bytes = ggml_nbytes(weight->tensor);
+
+    ple_tensor_index.file_ranges.resize(files.size());
+    ple_tensor_index.file_ranges.at(weight->idx).push_back({ weight->offs, weight->offs + tensor_bytes });
+    ple_tensor_index.deferred_bytes = tensor_bytes;
+}
+
+bool llama_model_loader::should_defer_ple_mmaps() const {
+    return defer_ple && use_mmap && !ple_tensor_index.empty();
+}
+
+void llama_model_loader::apply_ple_mmap_policy() const {
+    for (size_t idx = 0; idx < ple_tensor_index.file_ranges.size(); ++idx) {
+        for (const auto & range : ple_tensor_index.file_ranges[idx]) {
+            // sparse row lookups through get_rows: readahead would evict more than it fetches
+            mappings[idx]->random_fragment(range.first, range.last);
             mappings[idx]->dontneed_fragment(range.first, range.last);
         }
     }
@@ -721,8 +759,10 @@ bool llama_model_loader::get_arr(const std::string & key, std::vector<T> & resul
         case GGUF_TYPE_UINT32:
         case GGUF_TYPE_BOOL:
         case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same_v<T,  int32_t>) || (std::is_same_v<T, uint32_t>));  break;
+        case GGUF_TYPE_UINT64:
+        case GGUF_TYPE_INT64:   GGML_ASSERT((std::is_same_v<T,  int64_t>) || (std::is_same_v<T, uint64_t>));  break;
         default:
-            throw std::runtime_error(format("%s is not a float32, int32, uint32 or bool array", key.c_str()));
+            throw std::runtime_error(format("%s is not a float32, int32, uint32, int64, uint64 or bool array", key.c_str()));
     }
 
     result.resize(arr_info.length);
@@ -846,6 +886,30 @@ bool llama_model_loader::get_key_or_arr(const enum llm_kv kid, T & result, uint3
     return get_key_or_arr(llm_kv(kid), result, n, required);
 }
 
+bool llama_model_loader::get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required) {
+    const std::string key = llm_kv(kid);
+
+    const int id = gguf_find_key(meta, key.c_str());
+
+    if (id < 0) {
+        if (required) {
+            throw std::runtime_error(format("key not found in model: %s", key.c_str()));
+        }
+        return false;
+    }
+
+    // throw and error if type is an array
+    if (gguf_get_kv_type(meta, id) == GGUF_TYPE_ARRAY) {
+        if (required) {
+            throw std::runtime_error(format("expected scalar, found array for key: %s", key.c_str()));
+        }
+        return false;
+    }
+
+    return get_key(key, result, required);
+}
+
+
 const char * llama_model_loader::get_tensor_name(int i) const {
     return weights.at(i).tensor->name;
 }
@@ -934,10 +998,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(struct ggml_context * ctx
         return NULL;
     }
 
-    // skip unused tensors
+    // skip unused tensors (per-tensor detail at debug level; one summary at
+    // done_getting_tensors so ordinary loads are not flooded by an unused
+    // NextN/MTP head)
     if (flags & TENSOR_SKIP) {
         const size_t nbytes = ggml_nbytes(cur);
-        LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", name.c_str(), nbytes);
+        LLAMA_LOG_DEBUG("model has unused tensor %s (size = %zu bytes) -- ignoring\n", name.c_str(), nbytes);
+
+        n_skipped++;
+        size_skipped += nbytes;
 
         size_data -= nbytes;
         n_created++;
@@ -978,6 +1047,10 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 }
 
 void llama_model_loader::done_getting_tensors() const {
+    if (n_skipped > 0) {
+        LLAMA_LOG_WARN("%s: skipped %d unused tensors (%.1f MiB) -- e.g. a NextN/MTP head when MTP is not requested; per-tensor detail at debug log level\n",
+                __func__, n_skipped, size_skipped / 1024.0 / 1024.0);
+    }
     if (n_created != n_tensors) {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
     }
@@ -1392,5 +1465,6 @@ template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum ll
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(const std::string &, unsigned int &, bool);
 template std::enable_if<std::is_integral<unsigned int>::value, bool>::type llama_model_loader::get_arr_n<unsigned int>(enum llm_kv, unsigned int&, bool);
 template bool llama_model_loader::get_arr<uint32_t>(const std::string &, std::vector<uint32_t> &, bool);
+template bool llama_model_loader::get_arr<uint64_t>(const std::string &, std::vector<uint64_t> &, bool);
 template bool llama_model_loader::get_arr<int32_t, 8>(const std::string &, std::array<int32_t, 8> &, bool);
 template bool llama_model_loader::get_arr<uint32_t, 8>(const std::string &, std::array<uint32_t, 8> &, bool);

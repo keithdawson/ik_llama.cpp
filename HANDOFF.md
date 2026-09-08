@@ -1,3 +1,9 @@
+# Integration update — 2026-09-07
+
+Upstream main `fe215a8` is integrated with `numa-testbed` and its local CPU-exclusion/pageable-expert changes. User testing settles `GOMP_SPINCOUNT=7000` and individual CPU pinning as defaults. `GGML_NUMA_PIN=node` explicitly restores node-wide affinity. Both OpenMP environment overrides remain respected.
+
+The older notes below are historical. Kimi K3 is still absent from upstream architecture registration: this merge does not implement K3. Expert-affinity sharding remains available for supported MoE architectures with `--numa mirror --numa-mirror dense,kv`. This distributes whole experts between nodes; splitting each individual expert and reducing partial results remains unimplemented.
+
 # HANDOFF — pick up here
 
 Written 2026-07-28. Read this first, then `CLAUDE.md` (operator index),

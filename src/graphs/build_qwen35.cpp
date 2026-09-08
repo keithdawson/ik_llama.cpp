@@ -15,15 +15,7 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
     ggml_tensor * cur = nullptr;
 
     if (cparams.mtp_op_type != MTP_OP_NONE) {
-        ggml_tensor * hidden_states_from_main_model;
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
-        }
-        ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
-        ggml_set_input(hidden_states_from_main_model);
-        lctx.inp_mtp_states = hidden_states_from_main_model;
+        ggml_tensor * hidden_states_from_main_model = build_inp_mtp_states(hparams.n_embd);
 
         const int il_mtp = hparams.n_layer - 1;
         const auto & mtp_layer = model.layers[il_mtp];
@@ -72,11 +64,6 @@ ggml_cgraph * llm_build_context::build_qwen35moe() {
             inpL = cur;
         }
 
-        if (lctx.cparams.mtp) {
-            cb(inpL, "result_mtp_embd", -1);
-            ggml_set_output(inpL);
-        }
-
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
         cb(cur, "result_output", -1);
     }
@@ -99,15 +86,7 @@ ggml_cgraph * llm_build_context::build_qwen35() {
 
     if (cparams.mtp_op_type != MTP_OP_NONE) {
         // MTP tail-only graph
-        ggml_tensor * hidden_states_from_main_model;
-        if (cparams.mtp_op_type == MTP_OP_WARMUP || cparams.mtp_op_type == MTP_OP_UPDATE_ACCEPTED) {
-            hidden_states_from_main_model = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
-        } else {
-            hidden_states_from_main_model = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hparams.n_embd);
-        }
-        ggml_set_name(hidden_states_from_main_model, "inp_mtp_states");
-        ggml_set_input(hidden_states_from_main_model);
-        lctx.inp_mtp_states = hidden_states_from_main_model;
+        ggml_tensor * hidden_states_from_main_model = build_inp_mtp_states(hparams.n_embd);
 
         const int il_mtp = hparams.n_layer - 1;
         const auto & mtp_layer = model.layers[il_mtp];
@@ -151,14 +130,6 @@ ggml_cgraph * llm_build_context::build_qwen35() {
             inpL = cur;
         }
 
-        if (lctx.cparams.mtp) {
-            //struct ggml_tensor * embd_copy = ggml_dup(ctx0, inpL);
-            //cb(embd_copy, "result_mtp_embd", -1);
-            //ggml_set_output(embd_copy);
-            cb(inpL, "result_mtp_embd", -1);
-            ggml_set_output(inpL);
-        }
-
         cur = build_output(lctx, ctx0, inpL, model.output, model.output_norm, cb);
         cb(cur, "result_output", -1);
     }
@@ -182,18 +153,7 @@ struct ggml_tensor * llm_build_context::build_qwen35moe_mtp(
 
     ggml_tensor * token_emb = build_inp_embd_mtp(model.tok_embd);
 
-    ggml_tensor * token_emb_norm = llm_build_norm(ctx0, token_emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il);
-    ggml_tensor * hidden_state_norm = llm_build_norm(ctx0, prev_embeddings, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il);
-
-    ggml_tensor * cur;
-    if (mtp_layer.nextn.eh_proj != nullptr) {
-        ggml_tensor * combined = ggml_concat(ctx0, token_emb_norm, hidden_state_norm, 0);
-        cb(combined, "mtp_concat", il);
-        cur = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
-    } else {
-        cur = ggml_add(ctx0, token_emb_norm, hidden_state_norm);
-    }
-    cb(cur, "mtp_fused", il);
+    ggml_tensor * cur = build_mtp_input(mtp_layer, prev_embeddings, token_emb, il, "mtp_fused");
 
     GGML_ASSERT(il < (int)kv_self.k_l.size() && il < (int)kv_self.v_l.size());
     if (!kv_self.k_l[il] || !kv_self.v_l[il]) {
@@ -259,20 +219,7 @@ struct ggml_tensor * llm_build_context::build_qwen35_mtp(
 
     ggml_tensor * token_emb = build_inp_embd_mtp(model.tok_embd);
 
-    ggml_tensor * token_emb_norm = llm_build_norm(ctx0, token_emb, hparams, mtp_layer.nextn.enorm, NULL, LLM_NORM_RMS, cb, il);
-    ggml_tensor * hidden_state_norm = llm_build_norm(ctx0, prev_embeddings, hparams, mtp_layer.nextn.hnorm, NULL, LLM_NORM_RMS, cb, il);
-
-    ggml_tensor * cur;
-    if (mtp_layer.nextn.eh_proj != nullptr) {
-        // Full fusion: concat + project (27B, 4B, 2B, 0.8B)
-        ggml_tensor * combined = ggml_concat(ctx0, token_emb_norm, hidden_state_norm, 0);
-        cb(combined, "mtp_concat", il);
-        cur = llm_build_lora_mm(lctx, ctx0, mtp_layer.nextn.eh_proj, combined);
-    } else {
-        // 9B — no fc/eh_proj
-        cur = ggml_add(ctx0, token_emb_norm, hidden_state_norm);
-    }
-    cb(cur, "mtp_fused", il);
+    ggml_tensor * cur = build_mtp_input(mtp_layer, prev_embeddings, token_emb, il, "mtp_fused");
 
     // Self-Attention (wq may be shared from main model's last layer)
     GGML_ASSERT(il < (int)kv_self.k_l.size() && il < (int)kv_self.v_l.size());

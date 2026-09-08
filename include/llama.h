@@ -433,6 +433,8 @@ extern "C" {
         bool dry_run;       // skip loading tensors
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
+        bool defer_ple;        // keep the per-layer token embedding on the file instead of resident in memory (Linux only)
+        bool swa_compress;     // must match llama_context_params::swa_compress; the fit also assumes that context's n_ubatch
     };
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
@@ -494,14 +496,15 @@ extern "C" {
         bool graph_reuse;       // whether to reuse graphs when possible [EXPERIMENTAL]
         bool dsa;               // enable GLM DSA sparse attention (off by default) [EXPERIMENTAL]
         bool fused_idx_topk;    // enable the fused indexer topk op (off by default) [EXPERIMENTAL]
+        bool swa_compress;      // allocate sliding-window layers at window size instead of n_ctx (off by default) [EXPERIMENTAL]
         int  dsa_top_k;         // DSA top-k override (<0 => model's configured indexer_top_k) [EXPERIMENTAL]
         int  min_experts;
         float thresh_experts;
         bool only_active_experts;
         bool prefetch_experts;  // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
         int  prefetch_experts_threads; // number of expert prefetch workers (<=0 = auto)
-        bool k_cache_hadamard;  // if true, apply Hadamard transfrom to K-cache
-        bool v_cache_hadamard;  // if true, apply Hadamard transfrom to V-cache (needs FA)
+        bool k_cache_hadamard;  // if true, apply Hadamard transform to K-cache
+        bool v_cache_hadamard;  // if true, apply Hadamard transform to V-cache (needs FA)
         bool split_mode_graph_scheduling; // if true, force split mode graph scheduling
         //bool split_mode_f16;    // if true, cast intermediate results to f16 before copying to other GPUs
         bool scheduler_async;   // if true, with split mode "graph" graph evaluation will be done using multiple threads
@@ -515,6 +518,7 @@ extern "C" {
         void *              abort_callback_data;
         void *              offload_policy;
         void *              cuda_params;
+        int32_t             dflash_query_capacity; // internal DFlash query capacity override
     };
 
     // model quantization parameters
@@ -533,8 +537,8 @@ extern "C" {
         enum ggml_type ffn_gate_type;        // feedforward network gate type
         enum ggml_type ffn_down_type;        // feedforward network down type
         enum ggml_type ffn_up_type;          // feedforward network up type
-        enum ggml_type ffn_gate_inp_type;    // routed experts probabilities typy (relevant for MoE models only)
-        enum ggml_type extra_output_type;    // routed experts probabilities typy (relevant for MoE models only)
+        enum ggml_type ffn_gate_inp_type;    // routed experts probabilities type (relevant for MoE models only)
+        enum ggml_type extra_output_type;    // routed experts probabilities type (relevant for MoE models only)
         bool allow_requantize;               // allow quantizing non-f32/f16 tensors
         bool quantize_output_tensor;         // quantize output.weight
         bool only_copy;                      // only copy tensors - ftype, allow_requantize and quantize_output_tensor are ignored
@@ -700,11 +704,20 @@ extern "C" {
 
     LLAMA_API bool llama_model_has_recurrent(const struct llama_model * model);
 
+    // Returns whether the model uses the DeepSeek-V4 architecture.
+    LLAMA_API bool llama_model_is_deepseek4(const struct llama_model * model);
+
     // Returns true if the model is openPangu (conv-only recurrent state that rides the spec-rollback checkpoint)
     LLAMA_API bool llama_model_is_openpangu(const struct llama_model * model);
 
     // Returns true if the model is a Gemma 4 MTP assistant (external frozen-KV speculative drafter)
     LLAMA_API bool llama_model_is_gemma4_mtp_assistant(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_is_step35(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_is_qwen35_family(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_is_qwen4exp(const struct llama_model * model);
 
     LLAMA_API bool llama_is_gemma4_mtp_file(const char * path);
 
@@ -714,10 +727,12 @@ extern "C" {
     // (K-shift / context shift / self-extend), e.g. openPangu's latent cache.
     LLAMA_API bool llama_model_supports_ctx_shift(const struct llama_model * model);
 
-    // Returns false for models that can only reuse a cached sequence as a pure extension:
-    // rewinding into the middle of a decoded sequence loses per-position side state
-    // (e.g. openPangu keeps only the current recurrent conv state).
+    // Currently true for every model; no architecture is excluded from partial KV reuse.
     LLAMA_API bool llama_model_supports_partial_kv_reuse(const struct llama_model * model);
+
+    // The complete answer for a context: the model-level query above, plus the context options it
+    // cannot see (--swa-compress). Matches the gate the engine applies before a K-shift.
+    LLAMA_API bool llama_supports_ctx_shift(const struct llama_context * ctx);
 
     LLAMA_API const char * llama_model_arch_string(const struct llama_model * model);
 
@@ -845,6 +860,12 @@ extern "C" {
         LLAMA_SPEC_CKPT_CPU         =  3,
     };
 
+    enum llama_spec_ckpt_restore_result {
+        LLAMA_SPEC_CKPT_RESTORE_FAILED = 0,
+        LLAMA_SPEC_CKPT_RESTORE_DIRECT = 1,
+        LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED = 2,
+    };
+
     // Initialise the checkpoint system for the upcoming speculation window.
     LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens);
 
@@ -854,6 +875,10 @@ extern "C" {
     // Restore the recurrent state after speculative decode.
     LLAMA_API bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,
                                             llama_pos n_past, int accepted_step);
+
+    LLAMA_API enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
+            struct llama_context * ctx, llama_seq_id seq_id,
+            llama_pos n_past, int accepted_step);
 
     // Discard the saved checkpoint and reset internal mode state.
     LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
@@ -1063,7 +1088,7 @@ extern "C" {
     // Frees a batch of tokens allocated with llama_batch_init()
     LLAMA_API void llama_batch_free(struct llama_batch batch);
 
-    // Processes a batch of tokens with the ecoder part of the encoder-decoder model.
+    // Processes a batch of tokens with the encoder part of the encoder-decoder model.
     // Stores the encoder output internally for later use by the decoder cross-attention layers.
     //   0 - success
     // < 0 - error
@@ -1115,13 +1140,22 @@ extern "C" {
 
     // Logits for the ith token. For positive indices, Equivalent to:
     // llama_get_logits(ctx) + ctx->output_ids[i]*n_vocab
-    // Negative indicies can be used to access logits in reverse order, -1 is the last logit.
+    // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
     // Get the argmax token ID for DFlash draft position i without materializing full logits.
     // Returns LLAMA_TOKEN_NULL if argmax is not available (falls back to logits path).
     LLAMA_API llama_token llama_get_dflash_draft_token_ith(struct llama_context * ctx, int32_t i);
+
+    // Copy DFlash2 selector lattice after a draft decode with top_k*top_k scores
+    // and top_k candidate IDs per position.
+    LLAMA_API int32_t llama_get_dflash_draft_lattice_top_k(struct llama_context * ctx);
+    LLAMA_API int32_t llama_get_dflash_draft_lattice_n_positions(struct llama_context * ctx);
+    LLAMA_API bool llama_copy_dflash_draft_lattice(
+            struct llama_context * ctx,
+            float * scores, size_t score_count,
+            int32_t * ids, size_t id_count);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
@@ -1133,7 +1167,7 @@ extern "C" {
 
     // Get the embeddings for the ith token. For positive indices, Equivalent to:
     // llama_get_embeddings(ctx) + ctx->output_ids[i]*n_embd
-    // Negative indicies can be used to access embeddings in reverse order, -1 is the last embedding.
+    // Negative indices can be used to access embeddings in reverse order, -1 is the last embedding.
     // shape: [n_embd] (1-dimensional)
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
@@ -1436,7 +1470,7 @@ extern "C" {
 
 LLAMA_API void                   llama_sampler_reset(struct llama_sampler* smpl);
 
-/// @details Intializes a GBNF grammar, see grammars/README.md for details.
+/// @details Initializes a GBNF grammar, see grammars/README.md for details.
 /// @param vocab The vocabulary that this grammar will be used with.
 /// @param grammar_str The production rules for the grammar, encoded as a string. Returns an empty grammar if empty. Returns NULL if parsing of grammar_str fails.
 /// @param grammar_root The name of the start symbol for the grammar.
@@ -1499,7 +1533,7 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     /// @details Adaptive p sampler initializer
     /// @param target Select tokens near this probability (valid range 0.0 to 1.0; <0 = disabled)
     /// @param decay Decay rate for target adaptation over time. lower values -> faster but less stable adaptation. (valid range 0.0 to 1.0; ≤0 = no adaptation)
-    LLAMA_API struct llama_sampler_adaptive_p * llama_init_adaptive_p(int n_vocab,
+    LLAMA_API struct llama_sampler_adaptive_p * llama_init_adaptive_p(
            const float target,
            const float decay,
             const bool updt_w_cur,
@@ -1554,12 +1588,6 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
             struct llama_context * ctx,
           llama_token_data_array * candidates);
 
-    /// @details Randonly selects a token from the candidates following adaptive p sampler.
-    llama_token llama_sample_token_adaptive_p(
-            struct llama_context * ctx,
-          llama_token_data_array * candidates,
- struct llama_sampler_adaptive_p * adapt_p_ctx);
-
     //
     // Model split
     //
@@ -1593,7 +1621,21 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     // MTP
     //
 
+    enum llama_mtp_package {
+        LLAMA_MTP_PACKAGE_NONE = 0,
+        LLAMA_MTP_PACKAGE_EMBEDDED,
+        LLAMA_MTP_PACKAGE_TARGET_ONLY,
+        LLAMA_MTP_PACKAGE_COMPANION,
+        LLAMA_MTP_PACKAGE_INVALID,
+    };
+
     LLAMA_API int32_t llama_model_n_nextn_layer(const struct llama_model * model);
+
+    LLAMA_API enum llama_mtp_package llama_model_mtp_package(const struct llama_model * model);
+
+    LLAMA_API uint32_t llama_model_mtp_feature_width(const struct llama_model * model);
+
+    LLAMA_API bool llama_model_step35_has_nextn_weights(const struct llama_model * model);
 
     // Set which, if any, MTP operation the context will use
     LLAMA_API void llama_set_mtp_op_type(struct llama_context * ctx, enum llama_mtp_op_type mtp_op_type);
@@ -1623,6 +1665,9 @@ const std::vector<std::pair<std::string, struct ggml_tensor *>> & llama_internal
 // Randomly selects a token from the candidates based on their probabilities using given std::mt19937.
 // This is a temporary workaround in order to fix race conditions when sampling with multiple sequences.
 llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_data_array * candidates, std::mt19937 & rng);
+
+// Randomly selects a token from the candidates following adaptive p sampler.
+llama_token llama_sample_token_adaptive_p(struct llama_context * ctx, llama_token_data_array * candidates, struct llama_sampler_adaptive_p * adapt_p_ctx, std::mt19937 & rng);
 
 #endif // LLAMA_API_INTERNAL
 

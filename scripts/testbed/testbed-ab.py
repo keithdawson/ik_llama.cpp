@@ -232,7 +232,10 @@ def smoke_run(binary, model, extra_args, env_overrides, n_predict=32):
     kept, moved = [], []
     for l in r.stdout.splitlines():
         (moved if l.startswith("ggml_numa_init:") else kept).append(l)
-    return "\n".join(kept), r.stderr + "\n" + "\n".join(moved)
+    output = "\n".join(kept)
+    if not output.strip():
+        raise RuntimeError("smoke run produced empty output: " + " ".join(cmd))
+    return output, r.stderr + "\n" + "\n".join(moved)
 
 
 def cmd_smoke(args):
@@ -268,12 +271,12 @@ def cmd_smoke(args):
     out2, _ = smoke_run(binary, model, ["--numa", "mirror"],
                         {"GGML_NUMA_FAKE": "2", "GGML_NUMA_XGMI_GBPS": "8"})
     out3, _ = smoke_run(binary, model, ["--numa", "mirror"],
-                        {"GGML_NUMA_FAKE": "2", "GGML_NUMA_PIN": "cpu"})
+                        {"GGML_NUMA_FAKE": "2", "GGML_NUMA_PIN": "node"})
     out4, _ = smoke_run(binary, model, ["--numa", "mirror"],
                         {"GGML_NUMA_FAKE": "2", "GGML_NUMA_NT_COPY": "1"})
     check("identity: baseline == mirror", out0 == out1)
     check("identity: mirror == mirror+throttle", out1 == out2)
-    check("identity: mirror == mirror+pin", out1 == out3)
+    check("identity: default CPU pin == node pin", out1 == out3)
     check("identity: mirror == mirror+nt-copy", out1 == out4)
 
     # 4. expert sharding (--numa-mirror dense). On a dense model there are no routed experts,

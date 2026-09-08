@@ -110,7 +110,7 @@ std::pair<ggml_type, int> interleaved_properties(ggml_type type) {
         { GGML_TYPE_IQ4_KS_R4,   { GGML_TYPE_IQ4_KS, 4} },
         { GGML_TYPE_IQ5_KS_R4,   { GGML_TYPE_IQ5_KS, 4} },
         { GGML_TYPE_IQ5_K_R4,    { GGML_TYPE_IQ5_K, 4} },
-        { GGML_TYPE_MXFP4_R8,    { GGML_TYPE_MXFP4_R8, 8} },
+        { GGML_TYPE_MXFP4_R8,    { GGML_TYPE_MXFP4, 8} },
         { GGML_TYPE_Q8_KV_R8,    { GGML_TYPE_Q8_KV, 8} },
         { GGML_TYPE_Q8_K_R8,     { GGML_TYPE_Q8_0, 8} },
         { GGML_TYPE_BF16_R16,    { GGML_TYPE_BF16, 16} },
@@ -641,7 +641,8 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
                 new_type = GGML_TYPE_IQ6_K;
         }
         else if (qs.model.hparams.n_gqa() >= 4 &&
-                 !(arch == LLM_ARCH_DFLASH_DRAFT &&
+                 !((arch == LLM_ARCH_DFLASH_DRAFT ||
+                    (arch == LLM_ARCH_DFLASH && !qs.model.hparams.dflash_dsv4)) &&
                    (ftype == LLAMA_FTYPE_MOSTLY_Q4_K_M || ftype == LLAMA_FTYPE_MOSTLY_Q5_K_M))) {
             if      (new_type == GGML_TYPE_Q2_K || new_type == GGML_TYPE_IQ3_XXS) new_type = GGML_TYPE_IQ3_S;
             else if (new_type == GGML_TYPE_Q2_K_R4 || new_type == GGML_TYPE_IQ3_XXS_R4) new_type = GGML_TYPE_IQ3_K_R4;
@@ -1286,12 +1287,12 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     //  - qs.n_attention_wv == 3 * model.hparams.n_layer for Encoder-Decoder models
     //  - model.arch == LLM_ARCH_DECI                    for Deci-Nemotron   models
     //
-    GGML_ASSERT((qs.n_attention_wv == 0 ||
-                 qs.n_attention_wv == (int)model.hparams.n_layer ||
-                 qs.n_attention_wv == 3 * (int)model.hparams.n_layer ||
-                 model.arch == LLM_ARCH_DECI ||
-                 model.arch == LLM_ARCH_GEMMA4 ||
-                 model.arch == LLM_ARCH_UNKNOWN) && "n_attention_wv is unexpected");
+    //GGML_ASSERT((qs.n_attention_wv == 0 ||
+    //             qs.n_attention_wv == (int)model.hparams.n_layer ||
+    //             qs.n_attention_wv == 3 * (int)model.hparams.n_layer ||
+    //             model.arch == LLM_ARCH_DECI ||
+    //             model.arch == LLM_ARCH_GEMMA4 ||
+    //             model.arch == LLM_ARCH_UNKNOWN) && "n_attention_wv is unexpected");
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;
@@ -1452,8 +1453,13 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                llama_format_tensor_shape(tensor).c_str(),
                ggml_type_name(tensor->type));
 
+        bool quantize = tensor->type != GGML_TYPE_I32 &&
+                        tensor->type != GGML_TYPE_I64 &&
+                        tensor->type != GGML_TYPE_I16 &&
+                        tensor->type != GGML_TYPE_I8; // i.e., do not quantize tensors holding int values
+
         // This used to be a regex, but <regex> has an extreme cost to compile times.
-        bool quantize = name.rfind("weight") == name.size() - 6; // ends with 'weight'?
+        quantize &= name.rfind("weight") == name.size() - 6; // ends with 'weight'?
 
         // quantize only 2D and 3D tensors (experts)
         quantize &= (ggml_n_dims(tensor) >= 2);
@@ -1479,7 +1485,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
         // do not quantize Mamba's small yet 2D weights
         // NOTE: can't use LLM_TN here because the layer number is not known
-        quantize &= name.find("ssm_conv1d.weight") == std::string::npos;
+        quantize &= name.find("ssm_conv1d")        == std::string::npos;
         quantize &= name.find("ssm_x.weight")      == std::string::npos;
         quantize &= name.find("ssm_dt.weight")     == std::string::npos;
 

@@ -144,7 +144,7 @@ struct server_task_result {
 
     json data;
 
-    bool stop;
+    stop_type stop = STOP_TYPE_NONE;
     bool error;
     bool final_result = false;
     result_timings timings;
@@ -365,7 +365,7 @@ struct server_prompt_checkpoint {
         return data.size();
     }
 
-    json to_json() {
+    json to_json() const {
         json j;
         j["pos_min"] = pos_min;
         j["pos_max"] = pos_max;
@@ -412,7 +412,7 @@ struct server_prompt {
         };
     }
 
-    json to_json()
+    json to_json() const
     {
         json j;
         j["tokens"] = tokens.to_json();
@@ -425,7 +425,6 @@ struct server_prompt {
         tokens.from_json(j.at("tokens"));
         n_kept_prompt = j.value<llama_pos>("n_kept_prompt", 0);
         n_discarded_prompt = j.value<llama_pos>("n_discarded_prompt", 0);
-        n_kept_prompt = j.value<llama_pos>("n_kept_prompt", 0);
     }
 };
 

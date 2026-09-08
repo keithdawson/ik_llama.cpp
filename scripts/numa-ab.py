@@ -431,7 +431,7 @@ def cmd_matrix(args, workload):
             name=name, allowed_cpus=args.allowed_cpus, reserve_node0=args.reserve_node0,
             interval=args.interval, bw_tool=args.bw_tool, quiet=args.quiet,
             results_dir=args.results_dir,
-            env=(["GGML_NUMA_PIN=%s" % p] if p and p != "node" else []))
+            env=(["GGML_NUMA_PIN=%s" % p] if p else []))
         print("\n[%d/%d] %s" % (i + 1, len(combos), name))
         cmd_run(run_args, wl)
 

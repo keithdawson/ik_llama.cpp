@@ -370,7 +370,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_final() {
         msg.role = "assistant";
         msg.content = content;
     }
-    if (stop) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
 
@@ -412,8 +412,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_final() {
 json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     std::time_t t = std::time(0);
     std::string finish_reason = "length";
-    if (stop) {
-        //if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
+    if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
 
@@ -1094,7 +1093,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
         tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, think_tokens);
     }
     else {
-        prompt_tokens = std::move(prompt.tokens); 
+        prompt_tokens = prompt.tokens.clone();
         tokens_new_ex = tokens_new.clone();
     }
     const auto lcp_best = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
@@ -1111,7 +1110,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
             tokens = it->tokens.get_tokens_exclude_think(ctx, think_tokens);
         }
         else {
-            tokens = std::move(it->tokens);
+            tokens = it->tokens.clone();
         }
         const auto lcp_cur = tokens.get_common_prefix(ctx, tokens_new_ex);
         const float f_keep_cur = float(lcp_cur.first) / tokens.size();

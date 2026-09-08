@@ -33,7 +33,7 @@ When `--numa mirror` runs with GPU layers, the pinned OpenMP workers must spin o
 *briefly* and then sleep while the GPU works: spinning through GPU segments starves the
 CUDA driver thread (measured -12% pp / -5% tg on the testbed), while fully passive
 waiting makes every CPU expert segment pay thread-wake latency (~-10% pp). The binary
-therefore **auto-sets `OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=5000`** whenever
+therefore **auto-sets `OMP_WAIT_POLICY=PASSIVE` + `GOMP_SPINCOUNT=7000`** whenever
 mirror + `-ngl > 0` and *neither* variable is already in the environment (it logs one
 line when it does). 5000 is the measured optimum on the dual-EPYC target; a desktop
 Zen 5 preferred 25000 (more cores → shorter spin wins, since idle spinners cost more
@@ -58,7 +58,7 @@ Setting only the spin count will not reproduce the tuned number.
 
 **What to do with the answer:** pick the spin count with the best tg whose pp is also
 within noise of the best pp row (they usually agree; if not, favor tg for a serving
-box). If it's 5000, do nothing — the built-in default already matches. If it differs,
+box). If it's 7000, do nothing — the built-in default already matches. If it differs,
 set both variables explicitly in the serving environment — an explicit setting disables
 the auto-default:
 
@@ -242,7 +242,8 @@ start from; re-derive only if the hardware or model changes.
 | knob | result | notes |
 |---|---|---|
 | `threads` | **`-t 128`** | coarse sweep 96 / 128 / 144 / …; 128 won. Below the 192 physical cores, as expected for bandwidth-bound TG — do not assume "all cores" |
-| `spincount` | **8000 (provisional)** | coarse matrix first gave 5000, with 2500 and 10000 clearly worse. A finer sweep then put the peak at **8000**; an even finer one is in flight (2026-07-30). Treat as provisional: 7500 was in the *original* list and lost to 5000, so 5000/7500/8000 may all sit inside run-to-run noise. `tune-spincount.sh` now prints the per-point tg spread so a "win" can be checked against it — re-run the shortlist with `-r 7`. The built-in auto-default is still 5000 (was 25000, the 8-core testbed optimum); override in the serving env rather than rebuilding |
+| `spincount` | **7000** | User confirmed after additional testing, 2026-09-07; now the built-in hybrid default |
+| `pin` | **cpu** | User confirmed faster core pinning, 2026-09-07; default for mirror workers. Set `GGML_NUMA_PIN=node` for node-wide affinity |
 | `census` expert skew | **1.74** `max_over_mean` | per-expert routing skew for GLM 5.2. Comfortably shard-friendly (>>3 would mean a few hot experts dominate). Sits next to gemma-4's 1.78, which measured a *node* skew of ~1.25 |
 | `numactl` / `GGML_NUMA_RESERVE_CPUS` | not exercised | untouched so far; the reserve knob is hybrid-only insurance |
 | CUDA on the server | **resolved** | the long-standing `ggml_cuda_init: failed to initialize CUDA` with no reason string turned out to be a **Resizable BAR misconfiguration**, not a driver or library problem. Check ReBAR/above-4G-decoding in firmware before chasing `libcuda` stubs or `nvidia_uvm` |
